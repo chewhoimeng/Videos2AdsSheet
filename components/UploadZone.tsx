@@ -7,6 +7,11 @@ const INITIAL_CATEGORIES = [
   "Powder series", "Plushie", "Bag", "Bungkus", "Roll On", "Tea Series"
 ];
 
+// Google Apps Script has a strict payload limit. 
+// Files larger than ~50MB will likely fail or timeout.
+const MAX_FILE_SIZE_MB = 45;
+const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
+
 const UploadZone: React.FC = () => {
   // --- SETTINGS ---
   // Replace this with the URL you got from Google Apps Script "Deploy"
@@ -20,9 +25,26 @@ const UploadZone: React.FC = () => {
   const [isAddingNewCategory, setIsAddingNewCategory] = useState(false);
   const [newCategoryName, setNewCategoryName] = useState('');
   const [finalFileName, setFinalFileName] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  const handleError = (msg: string) => {
+    setErrorMessage(msg);
+    setStatus(UploadStatus.IDLE);
+    // Auto-clear error after 5 seconds if desired, currently sticking until next action
+    // setTimeout(() => setErrorMessage(null), 5000); 
+  };
+
   const startUploadProcess = async (file: File) => {
+    setErrorMessage(null); // Clear previous errors
+
+    // Size check
+    if (file.size > MAX_FILE_SIZE_BYTES) {
+      handleError(`File is too large (${(file.size / 1024 / 1024).toFixed(1)}MB). The limit is ${MAX_FILE_SIZE_MB}MB.`);
+      return;
+    }
+
     const reader = new FileReader();
     
     reader.onload = async () => {
@@ -54,24 +76,40 @@ const UploadZone: React.FC = () => {
 
       } catch (err) {
         console.error("Upload failed", err);
-        alert("Upload failed. Verify your Script URL and Permissions.");
-        setStatus(UploadStatus.IDLE);
+        handleError("Connection to Drive failed. Please check your internet or the Script URL.");
       }
+    };
+    
+    reader.onerror = () => {
+        handleError("Failed to read the file. It might be corrupted.");
     };
     
     reader.readAsDataURL(file);
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setErrorMessage(null); // Clear error on new attempt
     const file = e.target.files?.[0];
-    if (file?.type.startsWith('video/')) startUploadProcess(file);
-    else if (file) alert('Please upload a video file.');
+    if (file) {
+      if (file.type.startsWith('video/')) {
+        startUploadProcess(file);
+      } else {
+        handleError('Invalid file type. Please upload a video file.');
+      }
+    }
   };
 
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
+    setErrorMessage(null); // Clear error on new attempt
     const file = e.dataTransfer.files?.[0];
-    if (file?.type.startsWith('video/')) startUploadProcess(file);
+    if (file) {
+      if (file.type.startsWith('video/')) {
+        startUploadProcess(file);
+      } else {
+        handleError('Invalid file type. Please upload a video file.');
+      }
+    }
   };
 
   const handleAddNewCategory = () => {
@@ -89,6 +127,7 @@ const UploadZone: React.FC = () => {
     setProgress(0);
     setCustomName('');
     setFinalFileName(null);
+    setErrorMessage(null);
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
@@ -150,24 +189,57 @@ const UploadZone: React.FC = () => {
         </div>
       )}
 
+      {/* Error Message Banner */}
+      {errorMessage && (
+        <div className="max-w-xl mx-auto animate-fade-up">
+          <div className="bg-red-50 border border-red-100 rounded-2xl p-4 flex items-start gap-3 shadow-sm">
+            <div className="text-red-500 mt-0.5">
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+              </svg>
+            </div>
+            <div className="flex-1">
+              <h3 className="text-sm font-bold text-red-800">Upload Issue</h3>
+              <p className="text-sm text-red-700 mt-1 leading-snug">{errorMessage}</p>
+            </div>
+            <button onClick={() => setErrorMessage(null)} className="text-red-400 hover:text-red-600">
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
+              </svg>
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="relative group">
-        <div className="absolute -inset-1 bg-gradient-to-r from-blue-100 to-indigo-100 rounded-[24px] blur opacity-25 group-hover:opacity-40 transition duration-1000"></div>
+        <div className={`absolute -inset-1 bg-gradient-to-r from-blue-100 to-indigo-100 rounded-[24px] blur opacity-25 group-hover:opacity-40 transition duration-1000 ${errorMessage ? 'hidden' : 'block'}`}></div>
         <div 
           onDragOver={(e) => e.preventDefault()}
           onDrop={handleDrop}
-          className={`relative glass rounded-[24px] p-12 flex flex-col items-center justify-center min-h-[340px] border-2 border-dashed transition-all duration-500 ${status === UploadStatus.IDLE ? 'border-slate-200 hover:border-slate-900 cursor-pointer' : 'border-transparent'}`}
+          className={`relative glass rounded-[24px] p-12 flex flex-col items-center justify-center min-h-[340px] border-2 border-dashed transition-all duration-500 ${status === UploadStatus.IDLE ? 'border-slate-200 hover:border-slate-900 cursor-pointer' : 'border-transparent'} ${errorMessage ? 'border-red-200 bg-red-50/10' : ''}`}
           onClick={() => status === UploadStatus.IDLE && fileInputRef.current?.click()}
         >
           {status === UploadStatus.IDLE && (
             <div className="text-center">
-              <div className="w-16 h-16 bg-slate-900 rounded-full flex items-center justify-center mx-auto mb-6 shadow-xl transition-transform group-hover:scale-110 duration-500">
-                <svg className="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4v16m8-8H4"/>
-                </svg>
+              <div className={`w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-6 shadow-xl transition-transform group-hover:scale-110 duration-500 ${errorMessage ? 'bg-red-500 text-white' : 'bg-slate-900 text-white'}`}>
+                {errorMessage ? (
+                   <svg xmlns="http://www.w3.org/2000/svg" className="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                   </svg>
+                ) : (
+                  <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4v16m8-8H4"/>
+                  </svg>
+                )}
               </div>
-              <h3 className="text-2xl font-bold mb-2 tracking-tight text-slate-900">Ready to Sync</h3>
-              <p className="text-slate-400 font-light">Drag video here or click to browse</p>
+              <h3 className={`text-2xl font-bold mb-2 tracking-tight ${errorMessage ? 'text-red-900' : 'text-slate-900'}`}>
+                {errorMessage ? 'Try Again' : 'Ready to Sync'}
+              </h3>
+              <p className="text-slate-400 font-light">
+                {errorMessage ? 'Click to upload a valid file' : 'Drag video here or click to browse'}
+              </p>
               <input type="file" ref={fileInputRef} onChange={handleFileChange} accept="video/*" className="hidden" />
+              <p className="text-slate-300 text-[10px] mt-4">Max file size: {MAX_FILE_SIZE_MB}MB</p>
             </div>
           )}
 
