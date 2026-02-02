@@ -5,7 +5,7 @@
 const CONFIG = {
   FOLDER_ID: '1AyWWB3MnE-Bp7CxafzBvIt7txifiKOfe', // The ID of your Google Drive folder
   SPREADSHEET_ID: '1brCliL33hUu_IZaMfjb7AwlP7bXEmV6aMI26mx7ECxk', // Your Tracking spreadsheet
-  SHEET_NAME: 'Creative (Video)'
+  SHEET_NAME: 'Sheet1'
 };
 
 /**
