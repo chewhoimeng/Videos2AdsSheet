@@ -9,115 +9,138 @@ const CONFIG = {
 };
 
 /**
- * The "Listener": This function catches the data sent from your Vercel website.
+ * The "Listener": Handles incoming requests.
+ * Supports two actions: 'initialize' (get upload URL) and 'log' (save to sheet).
  */
 function doPost(e) {
   try {
     const data = JSON.parse(e.postData.contents);
-    const result = uploadFile(data.base64Data, data.fileName, data.category);
     
-    return ContentService.createTextOutput(JSON.stringify(result))
-      .setMimeType(ContentService.MimeType.JSON);
+    if (data.action === 'initialize') {
+      // Step 1: Get a Resumable Upload URL from Google Drive
+      const uploadUrl = getResumableUploadUrl(data.fileName, data.mimeType);
+      return sendJsonResponse({ status: 'success', uploadUrl: uploadUrl });
+      
+    } else if (data.action === 'log') {
+      // Step 3: Log the completed upload to the Sheet
+      logToSheet(data.category, data.fileId);
+      return sendJsonResponse({ status: 'success' });
+      
+    } else {
+      // Fallback: Old Base64 method (Legacy support, max 50MB)
+      // Only used if frontend sends old format
+      if (data.base64Data) {
+        const result = uploadFileLegacy(data.base64Data, data.fileName, data.category);
+        return sendJsonResponse(result);
+      }
+      throw new Error("Unknown action");
+    }
+    
   } catch (error) {
-    return ContentService.createTextOutput(JSON.stringify({ status: 'error', message: error.toString() }))
-      .setMimeType(ContentService.MimeType.JSON);
+    return sendJsonResponse({ status: 'error', message: error.toString() });
   }
 }
 
 /**
- * Main function to process the file and save it.
+ * Helper to send JSON response with CORS support
  */
-function uploadFile(base64Data, fileName, category) {
-  try {
-    const folder = DriveApp.getFolderById(CONFIG.FOLDER_ID);
-    
-    // Convert the data string back into a real video file
-    const parts = base64Data.split(',');
-    const contentType = parts[0].substring(parts[0].indexOf(":") + 1, parts[0].indexOf(";"));
-    const rawBase64 = parts[1] || parts[0];
-    
-    const bytes = Utilities.base64Decode(rawBase64);
-    const blob = Utilities.newBlob(bytes, contentType, fileName);
-    
-    // 1. Create the file in your specific Google Drive folder
-    const file = folder.createFile(blob);
-    const fileUrl = file.getUrl();
-    const actualFileName = file.getName();
-    
-    // 2. Log the record to your Google Sheet
-    logToSheet(category, actualFileName, fileUrl);
-    
-    return {
-      status: 'success',
-      url: fileUrl
-    };
-  } catch (error) {
-    console.error(error);
-    throw new Error('Upload failed: ' + error.toString());
+function sendJsonResponse(data) {
+  return ContentService.createTextOutput(JSON.stringify(data))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/**
+ * Step 1: Call Drive API to initiate a resumable upload session.
+ * Returns a URL that the client can PUT the file content to directly.
+ */
+function getResumableUploadUrl(fileName, mimeType) {
+  const url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable";
+  
+  const payload = {
+    "name": fileName,
+    "mimeType": mimeType,
+    "parents": [CONFIG.FOLDER_ID]
+  };
+
+  const params = {
+    method: "post",
+    contentType: "application/json",
+    headers: {
+      "Authorization": "Bearer " + ScriptApp.getOAuthToken()
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch(url, params);
+  
+  if (response.getResponseCode() === 200) {
+    // The upload URL is in the 'Location' header
+    return response.getAllHeaders()['Location'];
+  } else {
+    throw new Error('Failed to initiate upload: ' + response.getContentText());
   }
 }
 
 /**
- * Appends the upload record to the spreadsheet.
- * Custom Logic: 
- * Column E -> Product (Category)
- * Column I -> File Name
- * Column J -> Drive Link
+ * Step 3: Log details to sheet after client finishes upload.
+ * We fetch the file metadata using the ID to ensure it exists.
  */
-function logToSheet(category, fileName, fileUrl) {
-  try {
-    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
-    const sheet = ss.getSheetByName(CONFIG.SHEET_NAME) || ss.getSheets()[0];
-    
-    // Find the first row where Column E is empty
-    const nextRow = findNextUnusedRow(sheet, 5); // 5 is Column E
-    
-    // Column A (1): Upload Timestamp
-    sheet.getRange(nextRow, 1).setValue(new Date());
-    
-    // Column E (5): Product (Category)
-    sheet.getRange(nextRow, 5).setValue(category);
-    
-    // Column I (9): File Name
-    sheet.getRange(nextRow, 9).setValue(fileName);
-    
-    // Column J (10): Drive Link
-    sheet.getRange(nextRow, 10).setValue(fileUrl);
-    
-    // Optional: Auto-resize columns to fit content
-    sheet.autoResizeColumn(1);
-    sheet.autoResizeColumn(5);
-    sheet.autoResizeColumn(9);
-    sheet.autoResizeColumn(10);
-    
-  } catch (e) {
-    console.error("Sheet logging failed", e);
-  }
+function logToSheet(category, fileId) {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(CONFIG.SHEET_NAME) || ss.getSheets()[0];
+  
+  // Get file details from Drive to ensure accuracy
+  const file = DriveApp.getFileById(fileId);
+  const fileName = file.getName();
+  const fileUrl = file.getUrl();
+
+  // Find next empty row in Column 9 (File Name)
+  const nextRow = findNextUnusedRow(sheet, 9); 
+  
+  // Column A (1): Upload Timestamp
+  sheet.getRange(nextRow, 1).setValue(new Date());
+  
+  // Column E (5): Product (Category)
+  sheet.getRange(nextRow, 5).setValue(category);
+  
+  // Column I (9): File Name
+  sheet.getRange(nextRow, 9).setValue(fileName);
+  
+  // Column J (10): Drive Link
+  sheet.getRange(nextRow, 10).setValue(fileUrl);
+}
+
+/**
+ * Legacy Base64 Upload (Backup)
+ */
+function uploadFileLegacy(base64Data, fileName, category) {
+  const folder = DriveApp.getFolderById(CONFIG.FOLDER_ID);
+  const parts = base64Data.split(',');
+  const contentType = parts[0].substring(parts[0].indexOf(":") + 1, parts[0].indexOf(";"));
+  const rawBase64 = parts[1] || parts[0];
+  const bytes = Utilities.base64Decode(rawBase64);
+  const blob = Utilities.newBlob(bytes, contentType, fileName);
+  const file = folder.createFile(blob);
+  logToSheet(category, file.getId());
+  return { status: 'success', url: file.getUrl() };
 }
 
 /**
  * Helper to find the first truly empty row in a specific column.
- * This prevents jumping to the very end of the sheet if there are empty formatted rows.
  */
 function findNextUnusedRow(sheet, columnNumber) {
-  // Get all values in the specified column
-  const values = sheet.getRange(1, columnNumber, sheet.getMaxRows()).getValues();
-  
-  // Iterate from top to bottom (starting at row 2 to skip headers usually)
+  const maxRows = sheet.getMaxRows();
+  const values = sheet.getRange(1, columnNumber, maxRows).getValues();
   for (let i = 1; i < values.length; i++) {
-    if (values[i][0] === "" || values[i][0] === null || values[i][0] === undefined) {
-      return i + 1; // Return row index (1-based)
+    const cellValue = values[i][0];
+    if (cellValue === "" || cellValue === null || cellValue === undefined) {
+      return i + 1; 
     }
   }
-  
-  // If no empty row found in existing range, add to the very end
   return sheet.getLastRow() + 1;
 }
 
-/**
- * Required to allow the script to be used as a Web App.
- */
 function doGet() {
-  return HtmlService.createHtmlOutput("<h1>HYGR Creative Flow API is Active</h1>")
-    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+  return HtmlService.createHtmlOutput("<h1>HYGR Creative Flow API Active</h1>");
 }

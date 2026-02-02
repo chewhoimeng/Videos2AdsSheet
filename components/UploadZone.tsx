@@ -7,7 +7,8 @@ const INITIAL_CATEGORIES = [
   "Powder series", "Plushie", "Bag", "Bungkus", "Roll On", "Tea Series"
 ];
 
-const MAX_FILE_SIZE_MB = 750;
+// Increased limit to 2GB since we are now using Direct Drive Upload
+const MAX_FILE_SIZE_MB = 2000;
 const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
 
 const UploadZone: React.FC = () => {
@@ -24,79 +25,99 @@ const UploadZone: React.FC = () => {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const progressInterval = useRef<number | null>(null);
-
-  // Clear progress intervals on unmount
-  useEffect(() => {
-    return () => {
-      if (progressInterval.current) window.clearInterval(progressInterval.current);
-    };
-  }, []);
 
   const handleError = (msg: string) => {
     setErrorMessage(msg);
     setStatus(UploadStatus.IDLE);
-    if (progressInterval.current) window.clearInterval(progressInterval.current);
+    setProgress(0);
   };
 
   const startUploadProcess = async (file: File) => {
     setErrorMessage(null);
 
     if (file.size > MAX_FILE_SIZE_BYTES) {
-      handleError(`File is too large (${(file.size / 1024 / 1024).toFixed(1)}MB). The current portal limit is ${MAX_FILE_SIZE_MB}MB.`);
+      handleError(`File is too large (${(file.size / 1024 / 1024).toFixed(1)}MB). Limit is ${MAX_FILE_SIZE_MB}MB.`);
       return;
     }
 
-    const reader = new FileReader();
-    
-    reader.onload = async () => {
-      const base64Data = reader.result as string;
-      const extension = file.name.split('.').pop();
-      const baseName = customName.trim() || file.name.split('.').slice(0, -1).join('.');
-      const nameToUseForDrive = `${category} - ${baseName}.${extension}`;
+    const extension = file.name.split('.').pop();
+    const baseName = customName.trim() || file.name.split('.').slice(0, -1).join('.');
+    const nameToUseForDrive = `${category} - ${baseName}.${extension}`;
+    setFinalFileName(nameToUseForDrive);
 
-      setFinalFileName(nameToUseForDrive);
-      setStatus(UploadStatus.UPLOADING);
-      setProgress(5);
+    setStatus(UploadStatus.UPLOADING);
+    setProgress(1);
 
-      // Start simulated progress for large files
-      let simulatedProgress = 5;
-      progressInterval.current = window.setInterval(() => {
-        if (simulatedProgress < 92) {
-          // Slow down as we get closer to 90
-          const increment = simulatedProgress < 40 ? 1.5 : simulatedProgress < 70 ? 0.5 : 0.1;
-          simulatedProgress += increment;
-          setProgress(Math.floor(simulatedProgress));
-        }
-      }, 300);
+    try {
+      // --- STEP 1: INITIALIZE ---
+      // Ask Google Script for a "Resumable Upload URL"
+      const initResponse = await fetch(WEB_APP_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' }, // "text/plain" prevents preflight options check
+        body: JSON.stringify({
+          action: 'initialize',
+          fileName: nameToUseForDrive,
+          mimeType: file.type
+        })
+      });
 
-      try {
-        await fetch(WEB_APP_URL, {
-          method: 'POST',
-          mode: 'no-cors',
-          headers: { 'Content-Type': 'text/plain' },
-          body: JSON.stringify({
-            base64Data: base64Data,
-            fileName: nameToUseForDrive,
-            category: category
-          })
-        });
+      if (!initResponse.ok) throw new Error("Failed to connect to backend script.");
+      
+      const initData = await initResponse.json();
+      if (initData.status === 'error') throw new Error(initData.message);
+      
+      const uploadUrl = initData.uploadUrl;
+      
+      // --- STEP 2: DIRECT UPLOAD ---
+      // Upload binary directly to Google Drive (Bypassing Script Size Limits)
+      await new Promise<void>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('PUT', uploadUrl);
+        // Important: Do not set Content-Type header here manually, let browser handle it or Drive might complain
+        
+        xhr.upload.onprogress = (event) => {
+          if (event.lengthComputable) {
+            const percentComplete = (event.loaded / event.total) * 95; // Go up to 95%
+            setProgress(Math.max(5, Math.floor(percentComplete)));
+          }
+        };
 
-        if (progressInterval.current) window.clearInterval(progressInterval.current);
-        setProgress(100);
-        setTimeout(() => setStatus(UploadStatus.SUCCESS), 500);
+        xhr.onload = () => {
+          if (xhr.status === 200 || xhr.status === 201) {
+            // Drive returns the file metadata on success
+            const responseData = JSON.parse(xhr.responseText);
+            // Pass the file ID to the next step
+            resolve(responseData.id); 
+          } else {
+            reject(new Error(`Upload failed with status ${xhr.status}`));
+          }
+        };
 
-      } catch (err) {
-        console.error("Upload failed", err);
-        handleError("Connection to Drive failed. Large files (750MB) may exceed Google Apps Script payload limits.");
-      }
-    };
-    
-    reader.onerror = () => {
-        handleError("Failed to read the file. Your browser might have run out of memory reading a large file.");
-    };
-    
-    reader.readAsDataURL(file);
+        xhr.onerror = () => reject(new Error("Network error during upload."));
+        xhr.send(file);
+      })
+      .then(async (fileId) => {
+         // --- STEP 3: LOGGING ---
+         // Tell Google Script the upload is done so it can update the Sheet
+         setProgress(98);
+         await fetch(WEB_APP_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain' },
+            body: JSON.stringify({
+              action: 'log',
+              fileId: fileId,
+              category: category
+            })
+         });
+         
+         setProgress(100);
+         setTimeout(() => setStatus(UploadStatus.SUCCESS), 500);
+      });
+
+    } catch (err: any) {
+      console.error("Process failed", err);
+      handleError(err.message || "An unexpected error occurred.");
+    }
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -140,7 +161,6 @@ const UploadZone: React.FC = () => {
     setCustomName('');
     setFinalFileName(null);
     setErrorMessage(null);
-    if (progressInterval.current) window.clearInterval(progressInterval.current);
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
@@ -216,7 +236,7 @@ const UploadZone: React.FC = () => {
             </div>
             <button onClick={() => setErrorMessage(null)} className="text-red-400/50 hover:text-red-400">
               <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
+                <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
               </svg>
             </button>
           </div>
