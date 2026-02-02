@@ -7,11 +7,14 @@ const INITIAL_CATEGORIES = [
   "Powder series", "Plushie", "Bag", "Bungkus", "Roll On", "Tea Series"
 ];
 
-// Increased limit to 2GB since we are now using Direct Drive Upload
-const MAX_FILE_SIZE_MB = 2000;
+// Limit increased to 1TB. 
+// Note: Browsers may struggle with files >50GB depending on available RAM/Cache, 
+// but the app logic will no longer block it.
+const MAX_FILE_SIZE_MB = 1048576; 
 const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
 
 const UploadZone: React.FC = () => {
+  // IMPORTANT: AFTER RE-DEPLOYING GOOGLE SCRIPT, PASTE THE NEW URL HERE
   const WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbxkTRxnTRO2Ks2ph9M1oEV-pa-eU34jUDzTVkFnGr2ekVxjT35UEkg6KvaE2Z5NaIS6/exec'; 
 
   const [status, setStatus] = useState<UploadStatus>(UploadStatus.IDLE);
@@ -36,7 +39,7 @@ const UploadZone: React.FC = () => {
     setErrorMessage(null);
 
     if (file.size > MAX_FILE_SIZE_BYTES) {
-      handleError(`File is too large (${(file.size / 1024 / 1024).toFixed(1)}MB). Limit is ${MAX_FILE_SIZE_MB}MB.`);
+      handleError(`File is too large. The limit is 1TB.`);
       return;
     }
 
@@ -53,11 +56,11 @@ const UploadZone: React.FC = () => {
       // Ask Google Script for a "Resumable Upload URL"
       const initResponse = await fetch(WEB_APP_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'text/plain' }, // "text/plain" prevents preflight options check
+        headers: { 'Content-Type': 'text/plain' },
         body: JSON.stringify({
           action: 'initialize',
           fileName: nameToUseForDrive,
-          mimeType: file.type
+          mimeType: file.type || 'application/octet-stream' // Fallback if type is missing
         })
       });
 
@@ -73,7 +76,7 @@ const UploadZone: React.FC = () => {
       await new Promise<void>((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         xhr.open('PUT', uploadUrl);
-        // Important: Do not set Content-Type header here manually, let browser handle it or Drive might complain
+        // Important: Let browser set Content-Type automatically for the PUT request
         
         xhr.upload.onprogress = (event) => {
           if (event.lengthComputable) {
@@ -84,9 +87,7 @@ const UploadZone: React.FC = () => {
 
         xhr.onload = () => {
           if (xhr.status === 200 || xhr.status === 201) {
-            // Drive returns the file metadata on success
             const responseData = JSON.parse(xhr.responseText);
-            // Pass the file ID to the next step
             resolve(responseData.id); 
           } else {
             reject(new Error(`Upload failed with status ${xhr.status}`));
@@ -116,7 +117,12 @@ const UploadZone: React.FC = () => {
 
     } catch (err: any) {
       console.error("Process failed", err);
-      handleError(err.message || "An unexpected error occurred.");
+      // Helpful error message if the user forgot to redeploy the script
+      if (err.message && err.message.includes('split')) {
+         handleError("Backend Version Mismatch: Please go to Apps Script > Deploy > New Deployment.");
+      } else {
+         handleError(err.message || "An unexpected error occurred.");
+      }
     }
   };
 
@@ -271,7 +277,7 @@ const UploadZone: React.FC = () => {
                 {errorMessage ? 'Click to upload a valid file' : 'Drag video here or click to browse'}
               </p>
               <input type="file" ref={fileInputRef} onChange={handleFileChange} accept="video/*" className="hidden" />
-              <p className="text-slate-600 text-[10px] mt-4 font-mono uppercase tracking-tighter">Capacity: {MAX_FILE_SIZE_MB}MB</p>
+              <p className="text-slate-600 text-[10px] mt-4 font-mono uppercase tracking-tighter">Capacity: Unlimited (Drive Storage)</p>
             </div>
           )}
 
@@ -286,7 +292,7 @@ const UploadZone: React.FC = () => {
                 </div>
                 <h3 className="text-xl font-bold mb-1 text-white">Syncing Large Asset</h3>
                 <p className="text-slate-500 text-[10px] truncate px-4 font-mono">{finalFileName}</p>
-                <p className="text-slate-600 text-[9px] mt-2 italic animate-pulse">Large files take a few minutes. Do not close this tab.</p>
+                <p className="text-slate-600 text-[9px] mt-2 italic animate-pulse">Processing large file. Do not close tab.</p>
               </div>
               
               <div className="h-1.5 w-full bg-white/10 rounded-full overflow-hidden mb-3 shadow-inner">

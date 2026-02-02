@@ -18,7 +18,9 @@ function doPost(e) {
     
     if (data.action === 'initialize') {
       // Step 1: Get a Resumable Upload URL from Google Drive
-      const uploadUrl = getResumableUploadUrl(data.fileName, data.mimeType);
+      // Default to binary stream if mimeType is missing to avoid API errors
+      const mime = data.mimeType || "application/octet-stream";
+      const uploadUrl = getResumableUploadUrl(data.fileName, mime);
       return sendJsonResponse({ status: 'success', uploadUrl: uploadUrl });
       
     } else if (data.action === 'log') {
@@ -28,12 +30,11 @@ function doPost(e) {
       
     } else {
       // Fallback: Old Base64 method (Legacy support, max 50MB)
-      // Only used if frontend sends old format
       if (data.base64Data) {
         const result = uploadFileLegacy(data.base64Data, data.fileName, data.category);
         return sendJsonResponse(result);
       }
-      throw new Error("Unknown action");
+      throw new Error("Unknown action. Please deploy the latest version of the script.");
     }
     
   } catch (error) {
