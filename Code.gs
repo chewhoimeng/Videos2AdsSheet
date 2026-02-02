@@ -69,20 +69,20 @@ function logToSheet(category, fileName, fileUrl) {
     const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
     const sheet = ss.getSheetByName(CONFIG.SHEET_NAME) || ss.getSheets()[0];
     
-    // Identify the next empty row for the new entry
-    const newRowIndex = sheet.getLastRow() + 1;
+    // Find the first row where Column E is empty
+    const nextRow = findNextUnusedRow(sheet, 5); // 5 is Column E
     
     // Column A (1): Upload Timestamp
-    sheet.getRange(newRowIndex, 1).setValue(new Date());
+    sheet.getRange(nextRow, 1).setValue(new Date());
     
     // Column E (5): Product (Category)
-    sheet.getRange(newRowIndex, 5).setValue(category);
+    sheet.getRange(nextRow, 5).setValue(category);
     
     // Column I (9): File Name
-    sheet.getRange(newRowIndex, 9).setValue(fileName);
+    sheet.getRange(nextRow, 9).setValue(fileName);
     
     // Column J (10): Drive Link
-    sheet.getRange(newRowIndex, 10).setValue(fileUrl);
+    sheet.getRange(nextRow, 10).setValue(fileUrl);
     
     // Optional: Auto-resize columns to fit content
     sheet.autoResizeColumn(1);
@@ -93,6 +93,25 @@ function logToSheet(category, fileName, fileUrl) {
   } catch (e) {
     console.error("Sheet logging failed", e);
   }
+}
+
+/**
+ * Helper to find the first truly empty row in a specific column.
+ * This prevents jumping to the very end of the sheet if there are empty formatted rows.
+ */
+function findNextUnusedRow(sheet, columnNumber) {
+  // Get all values in the specified column
+  const values = sheet.getRange(1, columnNumber, sheet.getMaxRows()).getValues();
+  
+  // Iterate from top to bottom (starting at row 2 to skip headers usually)
+  for (let i = 1; i < values.length; i++) {
+    if (values[i][0] === "" || values[i][0] === null || values[i][0] === undefined) {
+      return i + 1; // Return row index (1-based)
+    }
+  }
+  
+  // If no empty row found in existing range, add to the very end
+  return sheet.getLastRow() + 1;
 }
 
 /**
