@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { UploadStatus } from '../types';
 
 const INITIAL_CATEGORIES = [
@@ -7,11 +7,11 @@ const INITIAL_CATEGORIES = [
   "Powder series", "Plushie", "Bag", "Bungkus", "Roll On", "Tea Series"
 ];
 
-const MAX_FILE_SIZE_MB = 45;
+const MAX_FILE_SIZE_MB = 750;
 const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
 
 const UploadZone: React.FC = () => {
-  const WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbyOkmKG17LZKeAj4mlBP7w-rS2O2pVw02zxSq_dUAT34qLQ4eDEVGj-ptP8RCurSrbK/exec'; 
+  const WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbxkTRxnTRO2Ks2ph9M1oEV-pa-eU34jUDzTVkFnGr2ekVxjT35UEkg6KvaE2Z5NaIS6/exec'; 
 
   const [status, setStatus] = useState<UploadStatus>(UploadStatus.IDLE);
   const [progress, setProgress] = useState(0);
@@ -24,17 +24,26 @@ const UploadZone: React.FC = () => {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const progressInterval = useRef<number | null>(null);
+
+  // Clear progress intervals on unmount
+  useEffect(() => {
+    return () => {
+      if (progressInterval.current) window.clearInterval(progressInterval.current);
+    };
+  }, []);
 
   const handleError = (msg: string) => {
     setErrorMessage(msg);
     setStatus(UploadStatus.IDLE);
+    if (progressInterval.current) window.clearInterval(progressInterval.current);
   };
 
   const startUploadProcess = async (file: File) => {
     setErrorMessage(null);
 
     if (file.size > MAX_FILE_SIZE_BYTES) {
-      handleError(`File is too large (${(file.size / 1024 / 1024).toFixed(1)}MB). The limit is ${MAX_FILE_SIZE_MB}MB.`);
+      handleError(`File is too large (${(file.size / 1024 / 1024).toFixed(1)}MB). The current portal limit is ${MAX_FILE_SIZE_MB}MB.`);
       return;
     }
 
@@ -48,7 +57,18 @@ const UploadZone: React.FC = () => {
 
       setFinalFileName(nameToUseForDrive);
       setStatus(UploadStatus.UPLOADING);
-      setProgress(20);
+      setProgress(5);
+
+      // Start simulated progress for large files
+      let simulatedProgress = 5;
+      progressInterval.current = window.setInterval(() => {
+        if (simulatedProgress < 92) {
+          // Slow down as we get closer to 90
+          const increment = simulatedProgress < 40 ? 1.5 : simulatedProgress < 70 ? 0.5 : 0.1;
+          simulatedProgress += increment;
+          setProgress(Math.floor(simulatedProgress));
+        }
+      }, 300);
 
       try {
         await fetch(WEB_APP_URL, {
@@ -62,17 +82,18 @@ const UploadZone: React.FC = () => {
           })
         });
 
+        if (progressInterval.current) window.clearInterval(progressInterval.current);
         setProgress(100);
         setTimeout(() => setStatus(UploadStatus.SUCCESS), 500);
 
       } catch (err) {
         console.error("Upload failed", err);
-        handleError("Connection to Drive failed. Please check your internet or the Script URL.");
+        handleError("Connection to Drive failed. Large files (750MB) may exceed Google Apps Script payload limits.");
       }
     };
     
     reader.onerror = () => {
-        handleError("Failed to read the file. It might be corrupted.");
+        handleError("Failed to read the file. Your browser might have run out of memory reading a large file.");
     };
     
     reader.readAsDataURL(file);
@@ -119,6 +140,7 @@ const UploadZone: React.FC = () => {
     setCustomName('');
     setFinalFileName(null);
     setErrorMessage(null);
+    if (progressInterval.current) window.clearInterval(progressInterval.current);
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
@@ -229,7 +251,7 @@ const UploadZone: React.FC = () => {
                 {errorMessage ? 'Click to upload a valid file' : 'Drag video here or click to browse'}
               </p>
               <input type="file" ref={fileInputRef} onChange={handleFileChange} accept="video/*" className="hidden" />
-              <p className="text-slate-600 text-[10px] mt-4">Max file size: {MAX_FILE_SIZE_MB}MB</p>
+              <p className="text-slate-600 text-[10px] mt-4 font-mono uppercase tracking-tighter">Capacity: {MAX_FILE_SIZE_MB}MB</p>
             </div>
           )}
 
@@ -242,15 +264,16 @@ const UploadZone: React.FC = () => {
                     <path className="opacity-80" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                   </svg>
                 </div>
-                <h3 className="text-xl font-bold mb-1 text-white">Syncing with Drive</h3>
-                <p className="text-slate-500 text-xs truncate px-4 font-mono">{finalFileName}</p>
+                <h3 className="text-xl font-bold mb-1 text-white">Syncing Large Asset</h3>
+                <p className="text-slate-500 text-[10px] truncate px-4 font-mono">{finalFileName}</p>
+                <p className="text-slate-600 text-[9px] mt-2 italic animate-pulse">Large files take a few minutes. Do not close this tab.</p>
               </div>
               
-              <div className="h-1.5 w-full bg-white/10 rounded-full overflow-hidden mb-3">
+              <div className="h-1.5 w-full bg-white/10 rounded-full overflow-hidden mb-3 shadow-inner">
                 <div className="h-full bg-white transition-all duration-300 ease-out" style={{ width: `${progress}%` }}></div>
               </div>
               <div className="flex justify-between items-center px-1">
-                <span className="text-[10px] text-slate-500 font-bold uppercase tracking-widest">Uploading</span>
+                <span className="text-[10px] text-slate-500 font-bold uppercase tracking-widest">Progress</span>
                 <span className="text-xs text-white font-semibold">{progress}%</span>
               </div>
             </div>
@@ -264,7 +287,7 @@ const UploadZone: React.FC = () => {
                 </svg>
               </div>
               <h3 className="text-3xl font-bold mb-3 tracking-tight text-white">Sync Successful</h3>
-              <p className="text-slate-500 mb-4 font-light italic">Stored in Drive as:</p>
+              <p className="text-slate-500 mb-4 font-light italic text-sm">Large file successfully mapped to Drive.</p>
               <div className="bg-white/5 px-6 py-3 rounded-2xl inline-block mb-10 border border-white/10">
                 <span className="text-white font-bold text-sm tracking-tight">{finalFileName}</span>
               </div>

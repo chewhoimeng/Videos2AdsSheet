@@ -3,8 +3,8 @@
  */
 
 const CONFIG = {
-  FOLDER_ID: '1d5IKLcxv2EUkLG0BgZNYU6grqO-wNmsV', // The ID of your Google Drive folder
-  SPREADSHEET_ID: '1kRB9rySIvEgh2H01efUkeUeFtlsD2nUpaJBJuYWQJVQ', // Your Tracking spreadsheet
+  FOLDER_ID: '1AyWWB3MnE-Bp7CxafzBvIt7txifiKOfe', // The ID of your Google Drive folder
+  SPREADSHEET_ID: '1brCliL33hUu_IZaMfjb7AwlP7bXEmV6aMI26mx7ECxk', // Your Tracking spreadsheet
   SHEET_NAME: 'Sheet1'
 };
 
@@ -42,9 +42,10 @@ function uploadFile(base64Data, fileName, category) {
     // 1. Create the file in your specific Google Drive folder
     const file = folder.createFile(blob);
     const fileUrl = file.getUrl();
+    const actualFileName = file.getName();
     
     // 2. Log the record to your Google Sheet
-    logToSheet(category, fileUrl);
+    logToSheet(category, actualFileName, fileUrl);
     
     return {
       status: 'success',
@@ -58,18 +59,37 @@ function uploadFile(base64Data, fileName, category) {
 
 /**
  * Appends the upload record to the spreadsheet.
+ * Custom Logic: 
+ * Column E -> Product (Category)
+ * Column I -> File Name
+ * Column J -> Drive Link
  */
-function logToSheet(category, fileUrl) {
+function logToSheet(category, fileName, fileUrl) {
   try {
     const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
     const sheet = ss.getSheetByName(CONFIG.SHEET_NAME) || ss.getSheets()[0];
     
-    // Adds a new row with: Date, Category, and the Drive Link
-    sheet.appendRow([
-      new Date(),
-      category,
-      fileUrl
-    ]);
+    // Identify the next empty row for the new entry
+    const newRowIndex = sheet.getLastRow() + 1;
+    
+    // Column A (1): Upload Timestamp
+    sheet.getRange(newRowIndex, 1).setValue(new Date());
+    
+    // Column E (5): Product (Category)
+    sheet.getRange(newRowIndex, 5).setValue(category);
+    
+    // Column I (9): File Name
+    sheet.getRange(newRowIndex, 9).setValue(fileName);
+    
+    // Column J (10): Drive Link
+    sheet.getRange(newRowIndex, 10).setValue(fileUrl);
+    
+    // Optional: Auto-resize columns to fit content
+    sheet.autoResizeColumn(1);
+    sheet.autoResizeColumn(5);
+    sheet.autoResizeColumn(9);
+    sheet.autoResizeColumn(10);
+    
   } catch (e) {
     console.error("Sheet logging failed", e);
   }
