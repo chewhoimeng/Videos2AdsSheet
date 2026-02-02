@@ -7,16 +7,20 @@ const INITIAL_CATEGORIES = [
   "Powder series", "Plushie", "Bag", "Bungkus", "Roll On", "Tea Series"
 ];
 
-// Limit increased to 1TB. 
-// Note: Browsers may struggle with files >50GB depending on available RAM/Cache, 
-// but the app logic will no longer block it.
-const MAX_FILE_SIZE_MB = 1048576; 
+// Effectively unlimited (1TB)
+const MAX_FILE_SIZE_MB = 1000000; 
 const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
 
-const UploadZone: React.FC = () => {
-  // IMPORTANT: AFTER RE-DEPLOYING GOOGLE SCRIPT, PASTE THE NEW URL HERE
-  const WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbxkTRxnTRO2Ks2ph9M1oEV-pa-eU34jUDzTVkFnGr2ekVxjT35UEkg6KvaE2Z5NaIS6/exec'; 
+// Default URL - Replace this in code if you want it permanent, 
+// otherwise use the UI config that appears on error.
+const DEFAULT_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbxkTRxnTRO2Ks2ph9M1oEV-pa-eU34jUDzTVkFnGr2ekVxjT35UEkg6KvaE2Z5NaIS6/exec';
 
+const UploadZone: React.FC = () => {
+  // Load URL from local storage if available, else default
+  const [webAppUrl, setWebAppUrl] = useState(() => {
+    return localStorage.getItem('hygr_api_url') || DEFAULT_WEB_APP_URL;
+  });
+  
   const [status, setStatus] = useState<UploadStatus>(UploadStatus.IDLE);
   const [progress, setProgress] = useState(0);
   const [customName, setCustomName] = useState('');
@@ -25,12 +29,22 @@ const UploadZone: React.FC = () => {
   const [isAddingNewCategory, setIsAddingNewCategory] = useState(false);
   const [newCategoryName, setNewCategoryName] = useState('');
   const [finalFileName, setFinalFileName] = useState<string | null>(null);
+  
+  // Specific error state to toggle the Config UI
+  const [errorType, setErrorType] = useState<'GENERIC' | 'CONFIG'>('GENERIC');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const handleError = (msg: string) => {
+  const handleUrlUpdate = (newUrl: string) => {
+    setWebAppUrl(newUrl);
+    localStorage.setItem('hygr_api_url', newUrl);
+    setErrorMessage(null); // Clear error to try again
+  };
+
+  const handleError = (msg: string, isConfigIssue: boolean = false) => {
     setErrorMessage(msg);
+    setErrorType(isConfigIssue ? 'CONFIG' : 'GENERIC');
     setStatus(UploadStatus.IDLE);
     setProgress(0);
   };
@@ -39,7 +53,7 @@ const UploadZone: React.FC = () => {
     setErrorMessage(null);
 
     if (file.size > MAX_FILE_SIZE_BYTES) {
-      handleError(`File is too large. The limit is 1TB.`);
+      handleError(`File is too large.`);
       return;
     }
 
@@ -53,34 +67,40 @@ const UploadZone: React.FC = () => {
 
     try {
       // --- STEP 1: INITIALIZE ---
-      // Ask Google Script for a "Resumable Upload URL"
-      const initResponse = await fetch(WEB_APP_URL, {
+      const initResponse = await fetch(webAppUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain' },
         body: JSON.stringify({
           action: 'initialize',
           fileName: nameToUseForDrive,
-          mimeType: file.type || 'application/octet-stream' // Fallback if type is missing
+          mimeType: file.type || 'application/octet-stream'
         })
       });
 
-      if (!initResponse.ok) throw new Error("Failed to connect to backend script.");
+      if (!initResponse.ok) {
+        throw new Error(`Connection failed (${initResponse.status}). Check API URL.`);
+      }
       
       const initData = await initResponse.json();
-      if (initData.status === 'error') throw new Error(initData.message);
+      
+      // Catch "SCRIPT_OUTDATED" or "split" errors
+      if (initData.status === 'error') {
+        if (initData.message.includes('split') || initData.message.includes('SCRIPT_OUTDATED')) {
+          throw new Error('SCRIPT_OUTDATED');
+        }
+        throw new Error(initData.message);
+      }
       
       const uploadUrl = initData.uploadUrl;
       
       // --- STEP 2: DIRECT UPLOAD ---
-      // Upload binary directly to Google Drive (Bypassing Script Size Limits)
       await new Promise<void>((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         xhr.open('PUT', uploadUrl);
-        // Important: Let browser set Content-Type automatically for the PUT request
         
         xhr.upload.onprogress = (event) => {
           if (event.lengthComputable) {
-            const percentComplete = (event.loaded / event.total) * 95; // Go up to 95%
+            const percentComplete = (event.loaded / event.total) * 95;
             setProgress(Math.max(5, Math.floor(percentComplete)));
           }
         };
@@ -90,18 +110,17 @@ const UploadZone: React.FC = () => {
             const responseData = JSON.parse(xhr.responseText);
             resolve(responseData.id); 
           } else {
-            reject(new Error(`Upload failed with status ${xhr.status}`));
+            reject(new Error(`Drive Upload failed (Status ${xhr.status})`));
           }
         };
 
-        xhr.onerror = () => reject(new Error("Network error during upload."));
+        xhr.onerror = () => reject(new Error("Network error during upload to Drive."));
         xhr.send(file);
       })
       .then(async (fileId) => {
          // --- STEP 3: LOGGING ---
-         // Tell Google Script the upload is done so it can update the Sheet
          setProgress(98);
-         await fetch(WEB_APP_URL, {
+         await fetch(webAppUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'text/plain' },
             body: JSON.stringify({
@@ -117,9 +136,8 @@ const UploadZone: React.FC = () => {
 
     } catch (err: any) {
       console.error("Process failed", err);
-      // Helpful error message if the user forgot to redeploy the script
-      if (err.message && err.message.includes('split')) {
-         handleError("Backend Version Mismatch: Please go to Apps Script > Deploy > New Deployment.");
+      if (err.message === 'SCRIPT_OUTDATED' || (err.message && err.message.includes('split'))) {
+         handleError("Backend Script Mismatch. Please Deploy New Version and update URL below.", true);
       } else {
          handleError(err.message || "An unexpected error occurred.");
       }
@@ -174,6 +192,39 @@ const UploadZone: React.FC = () => {
     <div className="space-y-8 animate-fade-up [animation-delay:400ms]">
       {status === UploadStatus.IDLE && (
         <div className="max-w-md mx-auto space-y-6">
+          {/* Config Error Section */}
+          {errorMessage && errorType === 'CONFIG' && (
+            <div className="bg-orange-500/10 border border-orange-500/30 rounded-2xl p-6 backdrop-blur-sm animate-fade-up">
+              <h3 className="text-orange-200 font-bold mb-2 flex items-center gap-2">
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                </svg>
+                Action Required: Update API
+              </h3>
+              <p className="text-orange-200/70 text-xs mb-4">
+                The Google Script backend is older than this app. 
+                <br/>1. Go to Apps Script Editor.
+                <br/>2. Click <strong>Deploy &gt; New Deployment</strong>.
+                <br/>3. Copy the <strong>Web app URL</strong> and paste it below.
+              </p>
+              <div className="flex gap-2">
+                <input 
+                  type="text" 
+                  value={webAppUrl}
+                  onChange={(e) => setWebAppUrl(e.target.value)}
+                  className="flex-1 bg-black/40 border border-orange-500/30 rounded-lg px-3 py-2 text-xs text-white font-mono"
+                  placeholder="https://script.google.com/..."
+                />
+                <button 
+                  onClick={() => handleUrlUpdate(webAppUrl)}
+                  className="bg-orange-500 text-black px-4 py-2 rounded-lg text-xs font-bold hover:bg-orange-400"
+                >
+                  Save & Retry
+                </button>
+              </div>
+            </div>
+          )}
+
           <div>
             <div className="flex justify-between items-end mb-3 ml-1">
               <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Category</label>
@@ -228,7 +279,7 @@ const UploadZone: React.FC = () => {
         </div>
       )}
 
-      {errorMessage && (
+      {errorMessage && errorType === 'GENERIC' && (
         <div className="max-w-xl mx-auto animate-fade-up">
           <div className="bg-red-500/10 border border-red-500/20 rounded-2xl p-4 flex items-start gap-3 shadow-sm backdrop-blur-sm">
             <div className="text-red-400 mt-0.5">
