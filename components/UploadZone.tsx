@@ -13,7 +13,7 @@ const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
 
 // Default URL - Replace this in code if you want it permanent, 
 // otherwise use the UI config that appears on error.
-const DEFAULT_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbxkTRxnTRO2Ks2ph9M1oEV-pa-eU34jUDzTVkFnGr2ekVxjT35UEkg6KvaE2Z5NaIS6/exec';
+const DEFAULT_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbzk-eBfjRhYwomYEJgBLs4yc98J1fykdbbAtB3NI8AUaDng6mF1aKdqj8LklrvRpS4/exec';
 
 const UploadZone: React.FC = () => {
   // Load URL from local storage if available, else default
