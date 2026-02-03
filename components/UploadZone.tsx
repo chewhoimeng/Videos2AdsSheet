@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef } from 'react';
 import { UploadStatus } from '../types';
 
 const INITIAL_CATEGORIES = [
@@ -7,16 +7,13 @@ const INITIAL_CATEGORIES = [
   "Powder series", "Plushie", "Bag", "Bungkus", "Roll On", "Tea Series"
 ];
 
-// Effectively unlimited (1TB)
-const MAX_FILE_SIZE_MB = 1000000; 
-const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
+// Chunk size for upload (10MB) - Multiples of 256KB required by Google
+const CHUNK_SIZE = 10 * 1024 * 1024; 
+const MAX_FILE_SIZE_BYTES = 1024 * 1024 * 1024 * 1024; // 1TB limit
 
-// Default URL - Replace this in code if you want it permanent, 
-// otherwise use the UI config that appears on error.
 const DEFAULT_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbzk-eBfjRhYwomYEJgBLs4yc98J1fykdbbAtB3NI8AUaDng6mF1aKdqj8LklrvRpS4/exec';
 
 const UploadZone: React.FC = () => {
-  // Load URL from local storage if available, else default
   const [webAppUrl, setWebAppUrl] = useState(() => {
     return localStorage.getItem('hygr_api_url') || DEFAULT_WEB_APP_URL;
   });
@@ -30,7 +27,6 @@ const UploadZone: React.FC = () => {
   const [newCategoryName, setNewCategoryName] = useState('');
   const [finalFileName, setFinalFileName] = useState<string | null>(null);
   
-  // Specific error state to toggle the Config UI
   const [errorType, setErrorType] = useState<'GENERIC' | 'CONFIG'>('GENERIC');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   
@@ -39,7 +35,7 @@ const UploadZone: React.FC = () => {
   const handleUrlUpdate = (newUrl: string) => {
     setWebAppUrl(newUrl);
     localStorage.setItem('hygr_api_url', newUrl);
-    setErrorMessage(null); // Clear error to try again
+    setErrorMessage(null);
   };
 
   const handleError = (msg: string, isConfigIssue: boolean = false) => {
@@ -48,6 +44,113 @@ const UploadZone: React.FC = () => {
     setStatus(UploadStatus.IDLE);
     setProgress(0);
   };
+
+  // --- THE CHUNKED UPLOADER ---
+  const uploadFileInChunks = async (file: File, uploadUrl: string): Promise<string> => {
+    const totalSize = file.size;
+    let start = 0;
+
+    while (start < totalSize) {
+      const end = Math.min(start + CHUNK_SIZE, totalSize);
+      const chunk = file.slice(start, end);
+
+      // Retry logic for unstable connections
+      let retries = 3;
+      while (retries > 0) {
+        try {
+          await new Promise<void>((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.open('PUT', uploadUrl);
+            xhr.setRequestHeader('Content-Range', `bytes ${start}-${end - 1}/${totalSize}`);
+            
+            xhr.onload = () => {
+              // 308 = Resume Incomplete (Good! Expecting more chunks)
+              // 200/201 = Created (Done!)
+              if (xhr.status === 308 || xhr.status === 200 || xhr.status === 201) {
+                resolve();
+              } else {
+                reject(new Error(`Chunk upload failed: ${xhr.status}`));
+              }
+            };
+            
+            xhr.onerror = () => reject(new Error("Network error during chunk upload"));
+            xhr.send(chunk);
+          });
+          break; // Success, exit retry loop
+        } catch (e) {
+          retries--;
+          if (retries === 0) throw e;
+          await new Promise(r => setTimeout(r, 1000)); // Wait 1s before retry
+        }
+      }
+
+      // Update progress
+      start = end;
+      const percent = Math.floor((start / totalSize) * 95); // Scale to 95%
+      setProgress(percent);
+    }
+    
+    // File fully sent. Ideally, the last request returned 200/201 with the file ID.
+    // However, sometimes we need to query status or just trust the backend log step.
+    // We will assume success if we reached here, but we need the ID.
+    // Usually the LAST chunk response contains the ID in JSON.
+    // For simplicity with this flow, we will rely on a separate 'log' call that passes the filename
+    // or we'll parse the response of the last chunk if possible. 
+    // To be safer, let's just return true and let the logging step handle 'locating' or 'logging'.
+    // Actually, we need the ID for the logging step.
+    // Let's do a quick hack: The Resumable API returns the ID in the body of the final response.
+    return "UPLOAD_COMPLETE"; 
+  };
+  
+  // Modified to capture the ID from the last chunk
+  const uploadChunksAndGetId = async (file: File, uploadUrl: string): Promise<string> => {
+    const totalSize = file.size;
+    let start = 0;
+    let fileId = "";
+
+    while (start < totalSize) {
+      const end = Math.min(start + CHUNK_SIZE, totalSize);
+      const chunk = file.slice(start, end);
+
+      await new Promise<void>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('PUT', uploadUrl);
+        xhr.setRequestHeader('Content-Range', `bytes ${start}-${end - 1}/${totalSize}`);
+        
+        xhr.onload = () => {
+          if (xhr.status === 308) {
+            // Incomplete, continue
+            resolve();
+          } else if (xhr.status === 200 || xhr.status === 201) {
+            // Complete!
+            try {
+              const resp = JSON.parse(xhr.responseText);
+              fileId = resp.id;
+              resolve();
+            } catch (e) {
+              // If response isn't JSON, we might have an issue, but let's proceed
+              resolve();
+            }
+          } else {
+            reject(new Error(`Upload failed with status ${xhr.status}`));
+          }
+        };
+        xhr.onerror = () => reject(new Error("Network error"));
+        xhr.send(chunk);
+      });
+
+      start = end;
+      setProgress(Math.floor((start / totalSize) * 95));
+    }
+    
+    if (!fileId) {
+      // Fallback: If we didn't get ID from response (rare), throw error
+      // Or we can try to proceed if your backend logic supports finding by name (risky)
+      throw new Error("Upload finished but no File ID returned from Google.");
+    }
+    return fileId;
+  };
+
 
   const startUploadProcess = async (file: File) => {
     setErrorMessage(null);
@@ -66,7 +169,7 @@ const UploadZone: React.FC = () => {
     setProgress(1);
 
     try {
-      // --- STEP 1: INITIALIZE ---
+      // STEP 1: INITIALIZE
       const initResponse = await fetch(webAppUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain' },
@@ -77,96 +180,56 @@ const UploadZone: React.FC = () => {
         })
       });
 
-      if (!initResponse.ok) {
-        throw new Error(`Connection failed (${initResponse.status}). Check API URL.`);
-      }
+      if (!initResponse.ok) throw new Error(`API Connection Failed (${initResponse.status})`);
       
       const initData = await initResponse.json();
-      
-      // Catch "SCRIPT_OUTDATED" or "split" errors
-      if (initData.status === 'error') {
-        if (initData.message.includes('split') || initData.message.includes('SCRIPT_OUTDATED')) {
-          throw new Error('SCRIPT_OUTDATED');
-        }
-        throw new Error(initData.message);
-      }
+      if (initData.status === 'error') throw new Error(initData.message);
       
       const uploadUrl = initData.uploadUrl;
+      if (!uploadUrl) throw new Error("Backend failed to generate upload URL.");
+
+      // STEP 2: CHUNKED UPLOAD
+      // This is the magic part that handles >100MB files
+      const fileId = await uploadChunksAndGetId(file, uploadUrl);
       
-      // --- STEP 2: DIRECT UPLOAD ---
-      await new Promise<void>((resolve, reject) => {
-        const xhr = new XMLHttpRequest();
-        xhr.open('PUT', uploadUrl);
-        
-        xhr.upload.onprogress = (event) => {
-          if (event.lengthComputable) {
-            const percentComplete = (event.loaded / event.total) * 95;
-            setProgress(Math.max(5, Math.floor(percentComplete)));
-          }
-        };
-
-        xhr.onload = () => {
-          if (xhr.status === 200 || xhr.status === 201) {
-            const responseData = JSON.parse(xhr.responseText);
-            resolve(responseData.id); 
-          } else {
-            reject(new Error(`Drive Upload failed (Status ${xhr.status})`));
-          }
-        };
-
-        xhr.onerror = () => reject(new Error("Network error during upload to Drive."));
-        xhr.send(file);
-      })
-      .then(async (fileId) => {
-         // --- STEP 3: LOGGING ---
-         setProgress(98);
-         await fetch(webAppUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'text/plain' },
-            body: JSON.stringify({
-              action: 'log',
-              fileId: fileId,
-              category: category
-            })
-         });
-         
-         setProgress(100);
-         setTimeout(() => setStatus(UploadStatus.SUCCESS), 500);
+      // STEP 3: LOGGING
+      setProgress(98);
+      await fetch(webAppUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body: JSON.stringify({
+          action: 'log',
+          fileId: fileId,
+          category: category
+        })
       });
+      
+      setProgress(100);
+      setTimeout(() => setStatus(UploadStatus.SUCCESS), 500);
 
     } catch (err: any) {
       console.error("Process failed", err);
-      if (err.message === 'SCRIPT_OUTDATED' || (err.message && err.message.includes('split'))) {
-         handleError("Backend Script Mismatch. Please Deploy New Version and update URL below.", true);
+      const msg = err.message || "";
+      if (msg.includes('split') || msg.includes('INVALID_ACTION')) {
+         handleError("Backend Mismatch. Please Deploy New Version in Apps Script.", true);
       } else {
-         handleError(err.message || "An unexpected error occurred.");
+         handleError(msg || "An unexpected error occurred.");
       }
     }
   };
 
+  // Boilerplate handlers
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setErrorMessage(null);
     const file = e.target.files?.[0];
-    if (file) {
-      if (file.type.startsWith('video/')) {
-        startUploadProcess(file);
-      } else {
-        handleError('Invalid file type. Please upload a video file.');
-      }
-    }
+    if (file) file.type.startsWith('video/') ? startUploadProcess(file) : handleError('Invalid file type.');
   };
 
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setErrorMessage(null);
     const file = e.dataTransfer.files?.[0];
-    if (file) {
-      if (file.type.startsWith('video/')) {
-        startUploadProcess(file);
-      } else {
-        handleError('Invalid file type. Please upload a video file.');
-      }
-    }
+    if (file) file.type.startsWith('video/') ? startUploadProcess(file) : handleError('Invalid file type.');
   };
 
   const handleAddNewCategory = () => {
@@ -192,20 +255,15 @@ const UploadZone: React.FC = () => {
     <div className="space-y-8 animate-fade-up [animation-delay:400ms]">
       {status === UploadStatus.IDLE && (
         <div className="max-w-md mx-auto space-y-6">
-          {/* Config Error Section */}
           {errorMessage && errorType === 'CONFIG' && (
             <div className="bg-orange-500/10 border border-orange-500/30 rounded-2xl p-6 backdrop-blur-sm animate-fade-up">
               <h3 className="text-orange-200 font-bold mb-2 flex items-center gap-2">
-                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-                </svg>
                 Action Required: Update API
               </h3>
               <p className="text-orange-200/70 text-xs mb-4">
-                The Google Script backend is older than this app. 
-                <br/>1. Go to Apps Script Editor.
-                <br/>2. Click <strong>Deploy &gt; New Deployment</strong>.
-                <br/>3. Copy the <strong>Web app URL</strong> and paste it below.
+                1. Go to Apps Script. <br/>
+                2. Click <strong>Deploy &gt; New Deployment</strong>. <br/>
+                3. Paste the new URL below.
               </p>
               <div className="flex gap-2">
                 <input 
@@ -328,7 +386,7 @@ const UploadZone: React.FC = () => {
                 {errorMessage ? 'Click to upload a valid file' : 'Drag video here or click to browse'}
               </p>
               <input type="file" ref={fileInputRef} onChange={handleFileChange} accept="video/*" className="hidden" />
-              <p className="text-slate-600 text-[10px] mt-4 font-mono uppercase tracking-tighter">Capacity: Unlimited (Drive Storage)</p>
+              <p className="text-slate-600 text-[10px] mt-4 font-mono uppercase tracking-tighter">Capacity: Unlimited (Chunked Upload)</p>
             </div>
           )}
 
@@ -343,7 +401,7 @@ const UploadZone: React.FC = () => {
                 </div>
                 <h3 className="text-xl font-bold mb-1 text-white">Syncing Large Asset</h3>
                 <p className="text-slate-500 text-[10px] truncate px-4 font-mono">{finalFileName}</p>
-                <p className="text-slate-600 text-[9px] mt-2 italic animate-pulse">Processing large file. Do not close tab.</p>
+                <p className="text-slate-600 text-[9px] mt-2 italic animate-pulse">Uploading in parts. Do not close tab.</p>
               </div>
               
               <div className="h-1.5 w-full bg-white/10 rounded-full overflow-hidden mb-3 shadow-inner">
