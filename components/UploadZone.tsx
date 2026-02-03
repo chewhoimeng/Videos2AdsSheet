@@ -7,7 +7,7 @@ const INITIAL_CATEGORIES = [
   "Powder series", "Plushie", "Bag", "Bungkus", "Roll On", "Tea Series"
 ];
 
-// Chunk size for upload (10MB) - Multiples of 256KB required by Google
+// Chunk size for upload (1000MB) - Multiples of 256KB required by Google
 const CHUNK_SIZE = 10 * 1024 * 1024; 
 const MAX_FILE_SIZE_BYTES = 1024 * 1024 * 1024 * 1024; // 1TB limit
 
