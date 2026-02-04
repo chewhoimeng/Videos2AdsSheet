@@ -1,4 +1,3 @@
-
 import React, { useState, useRef } from 'react';
 import { UploadStatus } from '../types';
 
@@ -8,10 +7,11 @@ const INITIAL_CATEGORIES = [
   "Powder series", "Plushie", "Bag", "Bungkus", "Roll On", "Tea Series"
 ];
 
-const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB chunks for smooth progress
-const MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024 * 1024; // 20GB limit
+// 10MB Chunks: Efficient for large files, keeps request count reasonable.
+const CHUNK_SIZE = 10 * 1024 * 1024; 
+const MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024 * 1024; // 500GB limit
 
-// REPLACE THIS LINK with your actual Apps Script Web App URL for a permanent fix
+// REPLACE THIS LINK with your actual Apps Script Web App URL
 const DEFAULT_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbxxk66Ir54a-6iFbAHmgX-Q3jal9fkW5z_uB7Fyx54Y3bdXYZN71n3L_5XAfV75PEJI/exec';
 
 type SyncPhase = 'IDLE' | 'INITIALIZING' | 'TRANSFERRING' | 'FINALIZING';
@@ -34,9 +34,9 @@ const UploadZone: React.FC = () => {
   const testConnection = async () => {
     setTestStatus('TESTING');
     try {
-      const res = await fetch(webAppUrl);
-      if (res.ok) setTestStatus('OK');
-      else throw new Error();
+      // Use no-cors mode just to check if endpoint is reachable (script url returns 302 usually)
+      await fetch(webAppUrl, { mode: 'no-cors' });
+      setTestStatus('OK');
     } catch {
       setTestStatus('FAIL');
     }
@@ -49,6 +49,7 @@ const UploadZone: React.FC = () => {
     localStorage.setItem('hygr_api_url', cleanUrl);
   };
 
+  // Base upload function for a single chunk
   const uploadChunk = (chunk: Blob, start: number, end: number, total: number, url: string): Promise<any> => {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
@@ -56,30 +57,51 @@ const UploadZone: React.FC = () => {
       xhr.setRequestHeader('Content-Range', `bytes ${start}-${end - 1}/${total}`);
       
       xhr.onload = () => {
+        // 308: Resume Incomplete (Chunk accepted, expecting more)
         if (xhr.status === 308) {
           resolve({ complete: false });
-        } else if (xhr.status === 200 || xhr.status === 201) {
+        } 
+        // 200/201: OK/Created (Upload finished)
+        else if (xhr.status === 200 || xhr.status === 201) {
           try {
             const responseData = JSON.parse(xhr.responseText);
             resolve({ complete: true, data: responseData });
           } catch (e) {
-            // If Drive returns success but no JSON, we try to recover the ID from elsewhere or just assume it worked
-            resolve({ complete: true, data: { id: "UNKNOWN_ID" } });
+            // If Drive returns success but body isn't JSON, assume success (edge case)
+            resolve({ complete: true, data: { id: "UNKNOWN_ID_BUT_SUCCESS" } });
           }
         } else {
           reject(new Error(`Drive Server Error: ${xhr.status}`));
         }
       };
       
-      xhr.onerror = () => reject(new Error("Upload interrupted. Check your internet connection."));
+      xhr.onerror = () => reject(new Error("Network Error"));
       xhr.send(chunk);
     });
+  };
+
+  // Wrapper with Retry Logic - CRITICAL for large files
+  const uploadChunkWithRetry = async (chunk: Blob, start: number, end: number, total: number, url: string) => {
+    let attempts = 0;
+    const maxAttempts = 5;
+    
+    while (attempts < maxAttempts) {
+      try {
+        return await uploadChunk(chunk, start, end, total, url);
+      } catch (e) {
+        attempts++;
+        console.warn(`Chunk failed (attempt ${attempts}/${maxAttempts}). Retrying...`);
+        // Exponential backoff: 1s, 2s, 4s, 8s...
+        await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempts - 1)));
+      }
+    }
+    throw new Error("Upload failed. Connection too unstable.");
   };
 
   const startSync = async (file: File) => {
     setErrorMessage(null);
     if (file.size > MAX_FILE_SIZE_BYTES) {
-      setErrorMessage("File exceeds the 20GB threshold.");
+      setErrorMessage("File exceeds 500GB limit.");
       return;
     }
 
@@ -90,13 +112,13 @@ const UploadZone: React.FC = () => {
     
     setStatus(UploadStatus.UPLOADING);
     setPhase('INITIALIZING');
-    setProgress(2);
+    setProgress(1);
 
     try {
       // 1. Establish Session
       const initReq = await fetch(webAppUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'text/plain' }, // Avoids CORS preflight
+        headers: { 'Content-Type': 'text/plain' },
         body: JSON.stringify({ 
           action: 'initialize', 
           fileName: fileNameForCloud, 
@@ -104,6 +126,7 @@ const UploadZone: React.FC = () => {
         })
       });
       
+      if (!initReq.ok) throw new Error(`Connection failed (${initReq.status}). Check API URL.`);
       const initRes = await initReq.json();
       if (initRes.status === 'error') throw new Error(initRes.message);
 
@@ -116,21 +139,25 @@ const UploadZone: React.FC = () => {
         const end = Math.min(start + CHUNK_SIZE, file.size);
         const chunk = file.slice(start, end);
         
-        const result = await uploadChunk(chunk, start, end, file.size, initRes.uploadUrl);
+        // Use the retry wrapper
+        const result = await uploadChunkWithRetry(chunk, start, end, file.size, initRes.uploadUrl);
         
         if (result.complete) {
           driveFileId = result.data.id;
         }
         
         start = end;
-        // Progress: starts at 10%, ends at 90%
-        const percent = Math.floor(10 + (start / file.size) * 80);
+        // Progress Bar Logic: 
+        // 0-5%: Init
+        // 5-95%: Uploading
+        // 95-100%: Finalizing
+        const percent = Math.floor(5 + (start / file.size) * 90);
         setProgress(percent);
       }
 
       // 3. Log to Sheet
       setPhase('FINALIZING');
-      setProgress(95);
+      setProgress(98);
       
       const logReq = await fetch(webAppUrl, {
         method: 'POST',
@@ -149,13 +176,13 @@ const UploadZone: React.FC = () => {
       setTimeout(() => {
         setStatus(UploadStatus.SUCCESS);
         setPhase('IDLE');
-      }, 800);
+      }, 1000);
 
     } catch (err: any) {
       console.error("Sync Error:", err);
       setStatus(UploadStatus.IDLE);
       setPhase('IDLE');
-      setErrorMessage(err.message || "An unexpected error occurred. Verify your Apps Script URL.");
+      setErrorMessage(err.message || "An unexpected error occurred.");
     }
   };
 
@@ -163,6 +190,7 @@ const UploadZone: React.FC = () => {
     setStatus(UploadStatus.IDLE);
     setErrorMessage(null);
     setCustomName('');
+    setProgress(0);
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
@@ -298,7 +326,7 @@ const UploadZone: React.FC = () => {
               />
               
               <div className="flex gap-4 justify-center">
-                <div className="text-[10px] font-bold border border-white/10 rounded-full px-6 py-2.5 bg-white/5 text-slate-500 uppercase tracking-[0.2em]">MAX 20GB</div>
+                <div className="text-[10px] font-bold border border-white/10 rounded-full px-6 py-2.5 bg-white/5 text-slate-500 uppercase tracking-[0.2em]">MAX 500GB</div>
                 <div className="text-[10px] font-bold border border-white/10 rounded-full px-6 py-2.5 bg-white/5 text-slate-500 uppercase tracking-[0.2em]">AES-256</div>
               </div>
             </div>

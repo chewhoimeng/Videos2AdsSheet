@@ -1,6 +1,5 @@
-
 /**
- * HYGR Creative Flow - Production Backend v9.0
+ * HYGR Creative Flow - Production Backend v10.0
  * 
  * SETUP INSTRUCTIONS:
  * 1. Open Apps Script Editor.
@@ -82,22 +81,22 @@ function handleLog(data) {
     // Attempt to get file with retry loop (handles Drive API indexing delays)
     let file = null;
     let attempts = 0;
-    while (!file && attempts < 5) {
+    while (!file && attempts < 10) {
       try {
-        if (data.fileId && data.fileId !== "UNKNOWN_ID") {
+        if (data.fileId && data.fileId !== "UNKNOWN_ID" && data.fileId !== "UNKNOWN_ID_BUT_SUCCESS") {
           file = DriveApp.getFileById(data.fileId);
         }
       } catch (e) {
-        attempts++;
-        Utilities.sleep(1500); // Wait longer between retries
+        // Drive API sometimes takes a second to index the new file
+        console.warn("File not found yet, retrying... " + attempts);
       }
-      if (file) break;
       attempts++;
+      Utilities.sleep(1000); // Wait 1s between retries
     }
 
     const timestamp = new Date();
-    const fileName = file ? file.getName() : "Unknown Asset";
-    const fileUrl = file ? file.getUrl() : "Link pending Drive indexing";
+    const fileName = file ? file.getName() : "Unknown Asset (Upload Success)";
+    const fileUrl = file ? file.getUrl() : "File ID not found immediately";
 
     // Row Logic: A=Date, E=Category, I=Name, J=Link
     const rowData = [
@@ -136,7 +135,7 @@ function doGet() {
   // Simple reachability check
   return createResponse({ 
     status: 'active', 
-    version: '9.0', 
+    version: '10.0', 
     system: 'HYGR_PRODUCTION_API' 
   });
 }
