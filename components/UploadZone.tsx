@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { UploadStatus } from '../types';
 
 const INITIAL_CATEGORIES = [
@@ -7,387 +7,273 @@ const INITIAL_CATEGORIES = [
   "Powder series", "Plushie", "Bag", "Bungkus", "Roll On", "Tea Series"
 ];
 
-// 10MB Chunks: Efficient for large files, keeps request count reasonable.
-const CHUNK_SIZE = 10 * 1024 * 1024; 
-const MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024 * 1024; // 500GB limit
-
-// REPLACE THIS LINK with your actual Apps Script Web App URL
+const DRIVE_FOLDER_LINK = "https://drive.google.com/drive/u/0/folders/1AyWWB3MnE-Bp7CxafzBvIt7txifiKOfe";
 const DEFAULT_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbxxk66Ir54a-6iFbAHmgX-Q3jal9fkW5z_uB7Fyx54Y3bdXYZN71n3L_5XAfV75PEJI/exec';
 
-type SyncPhase = 'IDLE' | 'INITIALIZING' | 'TRANSFERRING' | 'FINALIZING';
+type SyncPhase = 'IDLE' | 'RENAMING' | 'WAITING_FOR_DRIVE' | 'SYNCED';
 
 const UploadZone: React.FC = () => {
   const [webAppUrl, setWebAppUrl] = useState(() => localStorage.getItem('hygr_api_url') || DEFAULT_WEB_APP_URL);
   const [showSettings, setShowSettings] = useState(false);
-  const [testStatus, setTestStatus] = useState<'IDLE' | 'TESTING' | 'OK' | 'FAIL'>('IDLE');
   
-  const [status, setStatus] = useState<UploadStatus>(UploadStatus.IDLE);
   const [phase, setPhase] = useState<SyncPhase>('IDLE');
-  const [progress, setProgress] = useState(0);
-  const [customName, setCustomName] = useState('');
   const [category, setCategory] = useState(INITIAL_CATEGORIES[0]);
-  const [finalFileName, setFinalFileName] = useState<string | null>(null);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [customName, setCustomName] = useState('');
+  const [extension, setExtension] = useState('.mp4');
+  const [generatedName, setGeneratedName] = useState('');
   
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  // Polling state
+  const [pollCount, setPollCount] = useState(0);
+  const timerRef = useRef<number | null>(null);
 
-  const testConnection = async () => {
-    setTestStatus('TESTING');
-    try {
-      // Use no-cors mode just to check if endpoint is reachable (script url returns 302 usually)
-      await fetch(webAppUrl, { mode: 'no-cors' });
-      setTestStatus('OK');
-    } catch {
-      setTestStatus('FAIL');
-    }
-    setTimeout(() => setTestStatus('IDLE'), 3000);
-  };
+  useEffect(() => {
+    // Auto-generate name when inputs change
+    const base = customName.trim() || "Untitled_Scene";
+    setGeneratedName(`${category} - ${base}${extension}`);
+  }, [category, customName, extension]);
 
-  const saveUrl = (url: string) => {
-    const cleanUrl = url.trim();
-    setWebAppUrl(cleanUrl);
-    localStorage.setItem('hygr_api_url', cleanUrl);
-  };
+  // Clean up timer
+  useEffect(() => {
+    return () => stopPolling();
+  }, []);
 
-  // Base upload function for a single chunk
-  const uploadChunk = (chunk: Blob, start: number, end: number, total: number, url: string): Promise<any> => {
-    return new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open('PUT', url, true);
-      xhr.setRequestHeader('Content-Range', `bytes ${start}-${end - 1}/${total}`);
-      
-      xhr.onload = () => {
-        // 308: Resume Incomplete (Chunk accepted, expecting more)
-        if (xhr.status === 308) {
-          resolve({ complete: false });
-        } 
-        // 200/201: OK/Created (Upload finished)
-        else if (xhr.status === 200 || xhr.status === 201) {
-          try {
-            const responseData = JSON.parse(xhr.responseText);
-            resolve({ complete: true, data: responseData });
-          } catch (e) {
-            // If Drive returns success but body isn't JSON, assume success (edge case)
-            resolve({ complete: true, data: { id: "UNKNOWN_ID_BUT_SUCCESS" } });
-          }
-        } else {
-          reject(new Error(`Drive Server Error: ${xhr.status}`));
-        }
-      };
-      
-      xhr.onerror = () => reject(new Error("Network Error"));
-      xhr.send(chunk);
-    });
-  };
-
-  // Wrapper with Retry Logic - CRITICAL for large files
-  const uploadChunkWithRetry = async (chunk: Blob, start: number, end: number, total: number, url: string) => {
-    let attempts = 0;
-    const maxAttempts = 5;
+  const handleFileDrop = (e: React.DragEvent | React.ChangeEvent<HTMLInputElement>) => {
+    e.preventDefault();
+    let file: File | undefined;
     
-    while (attempts < maxAttempts) {
-      try {
-        return await uploadChunk(chunk, start, end, total, url);
-      } catch (e) {
-        attempts++;
-        console.warn(`Chunk failed (attempt ${attempts}/${maxAttempts}). Retrying...`);
-        // Exponential backoff: 1s, 2s, 4s, 8s...
-        await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempts - 1)));
+    if ('dataTransfer' in e) {
+      file = e.dataTransfer.files?.[0];
+    } else {
+      file = (e.target as HTMLInputElement).files?.[0];
+    }
+
+    if (file) {
+      const ext = file.name.substring(file.name.lastIndexOf('.'));
+      setExtension(ext);
+      // Try to guess name from file if user hasn't typed one
+      if (!customName) {
+        setCustomName(file.name.replace(ext, '').replace(/_/g, ' '));
       }
+      setPhase('RENAMING');
     }
-    throw new Error("Upload failed. Connection too unstable.");
   };
 
-  const startSync = async (file: File) => {
-    setErrorMessage(null);
-    if (file.size > MAX_FILE_SIZE_BYTES) {
-      setErrorMessage("File exceeds 500GB limit.");
-      return;
-    }
+  const copyToClipboard = () => {
+    navigator.clipboard.writeText(generatedName);
+    // Visual feedback could be added here
+  };
 
-    const extension = file.name.split('.').pop();
-    const cleanBaseName = customName.trim() || file.name.split('.').slice(0, -1).join('.');
-    const fileNameForCloud = `${category} - ${cleanBaseName}.${extension}`;
-    setFinalFileName(fileNameForCloud);
+  const startWatcher = () => {
+    setPhase('WAITING_FOR_DRIVE');
+    setPollCount(0);
+    // Open Drive in new tab
+    window.open(DRIVE_FOLDER_LINK, '_blank');
     
-    setStatus(UploadStatus.UPLOADING);
-    setPhase('INITIALIZING');
-    setProgress(1);
+    // Start polling immediately
+    timerRef.current = window.setInterval(checkDriveStatus, 5000); // Check every 5s
+  };
 
+  const stopPolling = () => {
+    if (timerRef.current) {
+      window.clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+  };
+
+  const checkDriveStatus = async () => {
     try {
-      // 1. Establish Session
-      const initReq = await fetch(webAppUrl, {
+      setPollCount(prev => prev + 1);
+      
+      const response = await fetch(webAppUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain' },
-        body: JSON.stringify({ 
-          action: 'initialize', 
-          fileName: fileNameForCloud, 
-          mimeType: file.type || 'video/mp4' 
+        body: JSON.stringify({
+          action: 'scan',
+          fileName: generatedName,
+          category: category
         })
       });
-      
-      if (!initReq.ok) throw new Error(`Connection failed (${initReq.status}). Check API URL.`);
-      const initRes = await initReq.json();
-      if (initRes.status === 'error') throw new Error(initRes.message);
 
-      // 2. Resumable Upload
-      setPhase('TRANSFERRING');
-      let start = 0;
-      let driveFileId = "";
+      const data = await response.json();
       
-      while (start < file.size) {
-        const end = Math.min(start + CHUNK_SIZE, file.size);
-        const chunk = file.slice(start, end);
-        
-        // Use the retry wrapper
-        const result = await uploadChunkWithRetry(chunk, start, end, file.size, initRes.uploadUrl);
-        
-        if (result.complete) {
-          driveFileId = result.data.id;
-        }
-        
-        start = end;
-        // Progress Bar Logic: 
-        // 0-5%: Init
-        // 5-95%: Uploading
-        // 95-100%: Finalizing
-        const percent = Math.floor(5 + (start / file.size) * 90);
-        setProgress(percent);
+      if (data.status === 'found') {
+        stopPolling();
+        setPhase('SYNCED');
+      } else if (data.status === 'error') {
+        console.error("Backend Error:", data.message);
       }
-
-      // 3. Log to Sheet
-      setPhase('FINALIZING');
-      setProgress(98);
       
-      const logReq = await fetch(webAppUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain' },
-        body: JSON.stringify({ 
-          action: 'log', 
-          fileId: driveFileId, 
-          category: category 
-        })
-      });
-      
-      const logRes = await logReq.json();
-      if (logRes.status === 'error') throw new Error(logRes.message);
-
-      setProgress(100);
-      setTimeout(() => {
-        setStatus(UploadStatus.SUCCESS);
-        setPhase('IDLE');
-      }, 1000);
-
-    } catch (err: any) {
-      console.error("Sync Error:", err);
-      setStatus(UploadStatus.IDLE);
-      setPhase('IDLE');
-      setErrorMessage(err.message || "An unexpected error occurred.");
+    } catch (e) {
+      console.warn("Poll failed, retrying...", e);
     }
   };
 
-  const resetPortal = () => {
-    setStatus(UploadStatus.IDLE);
-    setErrorMessage(null);
+  const reset = () => {
+    stopPolling();
+    setPhase('IDLE');
     setCustomName('');
-    setProgress(0);
-    if (fileInputRef.current) fileInputRef.current.value = '';
+    setPollCount(0);
   };
 
   return (
-    <div className="space-y-10 animate-fade-up">
-      {/* Configuration Panel */}
+    <div className="space-y-8 animate-fade-up">
+      
+      {/* --- SETTINGS TOGGLE --- */}
       <div className="flex justify-center">
         <button 
           onClick={() => setShowSettings(!showSettings)}
-          className={`flex items-center gap-2 text-[10px] font-bold uppercase tracking-[0.2em] px-5 py-2.5 rounded-full border transition-all duration-300 ${showSettings ? 'bg-white text-black border-white shadow-lg' : 'text-slate-500 border-white/10 hover:border-white/30 hover:bg-white/5'}`}
+          className="text-[10px] font-bold uppercase tracking-widest text-slate-600 hover:text-white transition-colors"
         >
-          <svg className={`w-3.5 h-3.5 transition-transform duration-500 ${showSettings ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37a1.724 1.724 0 002.572-1.065z"/><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
-          {showSettings ? 'Close Setup' : 'Configure Connection'}
+          {showSettings ? 'Hide Config' : 'Configure API'}
         </button>
       </div>
 
       {showSettings && (
-        <div className="max-w-md mx-auto glass p-8 rounded-[32px] border-blue-500/30 animate-fade-up shadow-2xl">
-          <div className="flex items-center gap-3 mb-6">
-            <div className="w-8 h-8 rounded-full bg-blue-500/20 flex items-center justify-center">
-              <span className="text-blue-400 text-xs font-bold">API</span>
-            </div>
-            <h4 className="text-sm font-bold text-white tracking-tight">Sync Endpoint</h4>
+        <div className="max-w-md mx-auto glass p-6 rounded-2xl animate-fade-up mb-8">
+           <label className="text-[10px] uppercase font-bold text-slate-500 mb-2 block">Web App URL</label>
+           <input 
+             value={webAppUrl} 
+             onChange={(e) => {
+               setWebAppUrl(e.target.value);
+               localStorage.setItem('hygr_api_url', e.target.value);
+             }}
+             className="w-full bg-black/50 border border-white/10 rounded-lg px-3 py-2 text-xs font-mono text-white mb-2" 
+           />
+           <p className="text-[10px] text-slate-400">Deploy New Version in Apps Script if backend logic changes.</p>
+        </div>
+      )}
+
+
+      {/* --- PHASE 1: IDLE (Drag & Drop) --- */}
+      {phase === 'IDLE' && (
+        <div 
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={handleFileDrop}
+          className="relative glass rounded-[48px] p-12 flex flex-col items-center justify-center min-h-[400px] border-2 border-dashed border-white/10 hover:border-white/30 cursor-pointer transition-all group"
+        >
+          <div className="w-24 h-24 bg-white text-black rounded-3xl flex items-center justify-center mb-8 shadow-2xl transition-transform group-hover:scale-110 duration-500">
+            <svg className="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4v16m8-8H4"/></svg>
           </div>
-          
-          <div className="space-y-4">
-            <input 
-              type="text" 
-              value={webAppUrl} 
-              onChange={(e) => saveUrl(e.target.value)}
-              className="w-full bg-black/40 border border-white/10 rounded-2xl px-5 py-4 text-[11px] font-mono text-blue-100/70 outline-none focus:border-blue-500/50 focus:ring-4 focus:ring-blue-500/10 transition-all"
-              placeholder="Paste Google Apps Script Web App URL..."
-            />
+          <h3 className="text-4xl font-bold text-white mb-3">Native Sync</h3>
+          <p className="text-slate-400 font-light text-lg">Drop your file to begin robust sync</p>
+          <input type="file" onChange={handleFileDrop} className="hidden" id="file-upload" />
+          <label htmlFor="file-upload" className="absolute inset-0 cursor-pointer"></label>
+        </div>
+      )}
+
+
+      {/* --- PHASE 2: RENAMING (Data Entry) --- */}
+      {phase === 'RENAMING' && (
+        <div className="max-w-xl mx-auto glass p-8 rounded-[40px] shadow-2xl border-white/5 animate-fade-up">
+          <div className="text-center mb-8">
+            <h3 className="text-2xl font-bold text-white">Asset Details</h3>
+            <p className="text-slate-400 text-sm">Define metadata for the production tracker.</p>
+          </div>
+
+          <div className="space-y-6">
+            <div>
+              <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1 mb-2 block">Category</label>
+              <select 
+                value={category}
+                onChange={(e) => setCategory(e.target.value)}
+                className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-white/30"
+              >
+                {INITIAL_CATEGORIES.map(c => <option key={c} value={c} className="text-black">{c}</option>)}
+              </select>
+            </div>
             
+            <div>
+              <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1 mb-2 block">Scene Name</label>
+              <input 
+                value={customName}
+                onChange={(e) => setCustomName(e.target.value)}
+                placeholder="e.g. Master_Shot_01"
+                className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-white/30"
+              />
+            </div>
+
+            <div className="pt-6 border-t border-white/5">
+              <label className="text-[10px] font-bold text-emerald-400 uppercase tracking-widest ml-1 mb-2 block">Generated System Name</label>
+              <div className="flex gap-2">
+                <div className="flex-grow bg-emerald-500/10 border border-emerald-500/20 rounded-xl px-4 py-3 text-emerald-200 font-mono text-sm truncate">
+                  {generatedName}
+                </div>
+                <button 
+                  onClick={copyToClipboard}
+                  className="bg-white/10 hover:bg-white/20 text-white rounded-xl px-4 transition-colors"
+                  title="Copy Name"
+                >
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
+                </button>
+              </div>
+            </div>
+
             <button 
-              onClick={testConnection}
-              disabled={testStatus === 'TESTING'}
-              className={`w-full py-4 rounded-2xl text-[10px] font-bold uppercase tracking-[0.2em] transition-all duration-300 flex items-center justify-center gap-2 ${
-                testStatus === 'OK' ? 'bg-emerald-500 text-white' : 
-                testStatus === 'FAIL' ? 'bg-red-500 text-white' : 
-                'bg-white text-black hover:bg-slate-200 shadow-xl'
-              }`}
+              onClick={startWatcher}
+              className="w-full bg-white text-black font-bold py-4 rounded-xl hover:scale-[1.02] active:scale-[0.98] transition-all shadow-xl mt-4"
             >
-              {testStatus === 'IDLE' && 'Verify API Status'}
-              {testStatus === 'TESTING' && (
-                <>
-                  <svg className="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path></svg>
-                  Connecting...
-                </>
-              )}
-              {testStatus === 'OK' && 'Status: Operational'}
-              {testStatus === 'FAIL' && 'Status: Unreachable'}
+              Start Sync & Open Drive
             </button>
           </div>
-          
-          <div className="mt-6 flex gap-3 p-4 bg-white/5 rounded-2xl border border-white/5">
-            <svg className="w-4 h-4 text-slate-500 shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
-            <p className="text-[10px] text-slate-400 leading-relaxed">
-              Ensure you have clicked <strong>Deploy > New Deployment</strong> and authorized the script by running <code>setupPermissions</code> in the editor.
-            </p>
+        </div>
+      )}
+
+
+      {/* --- PHASE 3: WATCHING (Polling) --- */}
+      {phase === 'WAITING_FOR_DRIVE' && (
+        <div className="max-w-xl mx-auto text-center py-12 animate-fade-up">
+          <div className="mb-8 relative">
+            <div className="w-24 h-24 bg-white/5 rounded-full flex items-center justify-center mx-auto border border-white/10 animate-pulse">
+               <svg className="w-10 h-10 text-white/50" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+            </div>
+            <div className="absolute top-0 right-1/2 -mr-12 -mt-2">
+              <span className="flex h-4 w-4">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75"></span>
+                <span className="relative inline-flex rounded-full h-4 w-4 bg-blue-500"></span>
+              </span>
+            </div>
+          </div>
+
+          <h3 className="text-3xl font-bold text-white mb-2">Watching Drive...</h3>
+          <p className="text-slate-400 max-w-sm mx-auto mb-8 font-light leading-relaxed">
+            Please rename your file to <br/>
+            <span className="text-white font-mono bg-white/10 px-2 rounded mx-1">{generatedName}</span>
+            <br/>and upload it to the opened Drive tab.
+          </p>
+
+          <div className="inline-flex items-center gap-3 px-6 py-2 rounded-full bg-white/5 border border-white/10">
+            <span className="text-[10px] font-mono text-slate-500 uppercase tracking-widest">
+              Scan Attempt: {pollCount}
+            </span>
+          </div>
+
+          <div className="mt-12">
+            <button onClick={() => window.open(DRIVE_FOLDER_LINK, '_blank')} className="text-xs text-blue-400 hover:text-blue-300 underline underline-offset-4">
+              Re-open Drive Folder
+            </button>
           </div>
         </div>
       )}
 
-      {/* Main Upload Form */}
-      {status === UploadStatus.IDLE && !showSettings && (
-        <div className="max-w-md mx-auto space-y-6">
-          {errorMessage && (
-            <div className="bg-red-500/10 border border-red-500/30 p-5 rounded-3xl text-red-200 text-[11px] flex gap-4 animate-fade-up shadow-xl">
-              <div className="w-6 h-6 rounded-full bg-red-500/20 flex items-center justify-center shrink-0">
-                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
-              </div>
-              <div>
-                <p className="font-bold mb-1 uppercase tracking-wider">Sync Blocked</p>
-                <p className="opacity-80 leading-relaxed">{errorMessage}</p>
-              </div>
-            </div>
-          )}
 
-          <div className="glass p-8 rounded-[40px] space-y-8 border-white/5 shadow-2xl relative overflow-hidden group">
-            <div className="absolute top-0 right-0 w-32 h-32 bg-white/5 blur-3xl rounded-full -mr-16 -mt-16 group-hover:bg-white/10 transition-colors"></div>
-            
-            <div className="relative">
-              <label className="text-[10px] font-bold text-slate-500 uppercase tracking-[0.25em] block mb-4 ml-1">Asset Category</label>
-              <div className="relative">
-                <select 
-                  value={category} 
-                  onChange={(e) => setCategory(e.target.value)}
-                  className="w-full bg-white/5 border border-white/10 rounded-2xl px-6 py-5 text-white appearance-none focus:border-white/30 outline-none cursor-pointer transition-all hover:bg-white/[0.08]"
-                >
-                  {INITIAL_CATEGORIES.map(c => <option key={c} value={c} className="bg-slate-900">{c}</option>)}
-                </select>
-                <div className="absolute right-6 top-1/2 -translate-y-1/2 pointer-events-none text-slate-500">
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M19 9l-7 7-7-7"/></svg>
-                </div>
-              </div>
-            </div>
-
-            <div className="relative">
-              <label className="text-[10px] font-bold text-slate-500 uppercase tracking-[0.25em] block mb-4 ml-1">Label / Scene Name</label>
-              <input 
-                type="text" 
-                value={customName} 
-                onChange={(e) => setCustomName(e.target.value)}
-                placeholder="e.g. Master_Bungkus_Shot_02"
-                className="w-full bg-white/5 border border-white/10 rounded-2xl px-6 py-5 text-white focus:border-white/30 outline-none placeholder:text-white/20 transition-all hover:bg-white/[0.08]"
-              />
-            </div>
-          </div>
+      {/* --- PHASE 4: SUCCESS --- */}
+      {phase === 'SYNCED' && (
+        <div className="text-center animate-fade-up">
+           <div className="w-32 h-32 bg-emerald-500 rounded-full flex items-center justify-center mx-auto mb-8 shadow-2xl shadow-emerald-500/20">
+              <svg className="w-16 h-16 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M5 13l4 4L19 7"/></svg>
+           </div>
+           <h2 className="text-5xl font-bold text-white mb-4">Sync Complete</h2>
+           <p className="text-slate-400 mb-12">File detected in Drive and registered in Production Sheet.</p>
+           
+           <button 
+             onClick={reset}
+             className="px-12 py-4 bg-white text-black font-bold rounded-full hover:scale-105 transition-all"
+           >
+             Sync Another Asset
+           </button>
         </div>
       )}
-
-      {/* Dropzone / Progress Area */}
-      <div className="max-w-2xl mx-auto">
-        <div 
-          onClick={() => status === UploadStatus.IDLE && fileInputRef.current?.click()}
-          className={`relative glass rounded-[56px] p-12 flex flex-col items-center justify-center min-h-[440px] border-2 border-dashed transition-all duration-1000 ${status === UploadStatus.IDLE ? 'border-white/10 hover:border-white/50 cursor-pointer shadow-[0_40px_100px_rgba(0,0,0,0.4)] hover:scale-[1.01] bg-gradient-to-b from-white/[0.02] to-transparent' : 'border-transparent'}`}
-        >
-          {status === UploadStatus.IDLE && (
-            <div className="text-center group">
-              <div className="w-28 h-28 rounded-[40px] bg-white text-black flex items-center justify-center mx-auto mb-10 transition-all duration-700 group-hover:scale-110 group-hover:rotate-6 shadow-[0_20px_50px_rgba(255,255,255,0.2)]">
-                <svg className="w-12 h-12" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"/></svg>
-              </div>
-              <h3 className="text-5xl font-bold text-white mb-4 tracking-tighter">Drop Video</h3>
-              <p className="text-slate-400 font-light mb-14 text-xl tracking-tight">Tap to browse or drop production media</p>
-              
-              <input 
-                type="file" 
-                ref={fileInputRef} 
-                onChange={(e) => e.target.files?.[0] && startSync(e.target.files[0])} 
-                accept="video/*" 
-                className="hidden" 
-              />
-              
-              <div className="flex gap-4 justify-center">
-                <div className="text-[10px] font-bold border border-white/10 rounded-full px-6 py-2.5 bg-white/5 text-slate-500 uppercase tracking-[0.2em]">MAX 500GB</div>
-                <div className="text-[10px] font-bold border border-white/10 rounded-full px-6 py-2.5 bg-white/5 text-slate-500 uppercase tracking-[0.2em]">AES-256</div>
-              </div>
-            </div>
-          )}
-
-          {status === UploadStatus.UPLOADING && (
-            <div className="w-full max-w-md text-center">
-              <div className="mb-16">
-                <div className="relative w-32 h-32 mx-auto mb-10">
-                   <div className="absolute inset-0 rounded-full border-[8px] border-white/5"></div>
-                   <div className="absolute inset-0 rounded-full border-[8px] border-white border-t-transparent animate-spin shadow-[0_0_40px_rgba(255,255,255,0.15)]"></div>
-                   <div className="absolute inset-0 flex items-center justify-center">
-                      <span className="text-2xl font-bold font-mono text-white tracking-tighter">{progress}%</span>
-                   </div>
-                </div>
-                
-                <h3 className="text-3xl font-bold text-white mb-4 tracking-tight">Pushing Stream</h3>
-                
-                <div className="inline-flex items-center gap-3 px-5 py-2 rounded-full bg-white/5 border border-white/10">
-                  <span className="w-2.5 h-2.5 rounded-full bg-blue-500 animate-pulse shadow-[0_0_10px_rgba(59,130,246,0.8)]"></span>
-                  <span className="text-[11px] font-bold text-slate-400 uppercase tracking-[0.25em]">
-                    {phase === 'INITIALIZING' && 'Allocating Cloud Storage'}
-                    {phase === 'TRANSFERRING' && 'Streaming Binary Blocks'}
-                    {phase === 'FINALIZING' && 'Verifying Integrity'}
-                  </span>
-                </div>
-              </div>
-              
-              <div className="h-4 w-full bg-white/5 rounded-full overflow-hidden mb-8 shadow-inner relative">
-                <div 
-                  className="h-full bg-gradient-to-r from-blue-600 via-indigo-500 to-white transition-all duration-700 ease-out shadow-[0_0_30px_rgba(59,130,246,0.6)]" 
-                  style={{ width: `${progress}%` }}
-                ></div>
-              </div>
-              
-              <div className="flex justify-center items-center gap-3">
-                 <svg className="w-4 h-4 text-slate-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"/></svg>
-                 <p className="text-[11px] font-mono text-slate-500 uppercase tracking-[0.25em] truncate max-w-[280px]">{finalFileName}</p>
-              </div>
-            </div>
-          )}
-
-          {status === UploadStatus.SUCCESS && (
-            <div className="text-center animate-fade-up">
-              <div className="w-32 h-32 bg-emerald-500 rounded-full flex items-center justify-center mx-auto mb-12 shadow-[0_0_120px_rgba(16,185,129,0.4)] transition-transform hover:scale-105 duration-700">
-                <svg className="w-16 h-16 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="4" d="M5 13l4 4L19 7"/></svg>
-              </div>
-              <h2 className="text-6xl font-bold text-white mb-6 tracking-tighter">Sync Verified</h2>
-              <p className="text-slate-400 mb-16 text-xl max-w-sm mx-auto font-light leading-relaxed">
-                The asset has been securely staged in Drive and registered in the production master.
-              </p>
-              <button 
-                onClick={resetPortal} 
-                className="px-24 py-6 bg-white text-black text-sm font-bold rounded-3xl hover:scale-105 active:scale-95 transition-all shadow-2xl tracking-widest uppercase"
-              >
-                New Sync
-              </button>
-            </div>
-          )}
-        </div>
-      </div>
+      
     </div>
   );
 };

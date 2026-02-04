@@ -1,12 +1,10 @@
 /**
- * HYGR Creative Flow - Production Backend v10.0
+ * HYGR Creative Flow - Backend v11.0 (Native Sync)
  * 
- * SETUP INSTRUCTIONS:
- * 1. Open Apps Script Editor.
- * 2. Select 'setupPermissions' and click RUN.
- * 3. Click 'Deploy' > 'New Deployment'.
- * 4. Choose 'Web App'. Execute as 'Me'. Access: 'Anyone'.
- * 5. COPY the URL and paste it into the Web App's "Configure Connection" section.
+ * FEATURES:
+ * - Direct Drive Scanning (Bypasses upload timeouts)
+ * - Auto-Logging to Sheets
+ * - Idempotent Logging (Prevents duplicates)
  */
 
 const CONFIG = {
@@ -14,16 +12,6 @@ const CONFIG = {
   SPREADSHEET_ID: '1brCliL33hUu_IZaMfjb7AwlP7bXEmV6aMI26mx7ECxk', 
   SHEET_NAME: 'Sheet1'
 };
-
-function setupPermissions() {
-  try {
-    DriveApp.getFolderById(CONFIG.FOLDER_ID);
-    SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
-    console.log("Authorization Successful. System is Operational.");
-  } catch (e) {
-    console.error("Setup Error: Verify your Folder and Sheet IDs. " + e.toString());
-  }
-}
 
 function doPost(e) {
   try {
@@ -33,96 +21,108 @@ function doPost(e) {
     
     const data = JSON.parse(e.postData.contents);
     
-    if (data.action === 'initialize') {
-      return handleInitialize(data);
-    } else if (data.action === 'log') {
-      return handleLog(data);
+    // ACTION: SCAN (New Method)
+    // Checks if a file exists in Drive, and logs it if found.
+    if (data.action === 'scan') {
+      return checkDriveAndLog(data.fileName, data.category);
     }
     
-    return createResponse({ status: 'error', message: 'Unknown action: ' + data.action });
+    // ACTION: LOG (Legacy Method)
+    else if (data.action === 'log') {
+      return logToSheet(data.category, data.fileId);
+    }
+    
+    return createResponse({ status: 'error', message: 'Invalid Action' });
+    
   } catch (err) {
-    return createResponse({ status: 'error', message: 'CORS/System Error: ' + err.toString() });
+    return createResponse({ status: 'error', message: 'System Error: ' + err.toString() });
   }
 }
 
-function handleInitialize(data) {
-  const url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable";
-  const metadata = {
-    name: data.fileName,
-    mimeType: data.mimeType || 'video/mp4',
-    parents: [CONFIG.FOLDER_ID]
-  };
-
-  const response = UrlFetchApp.fetch(url, {
-    method: "POST",
-    contentType: "application/json",
-    headers: { "Authorization": "Bearer " + ScriptApp.getOAuthToken() },
-    payload: JSON.stringify(metadata),
-    muteHttpExceptions: true
-  });
-
-  const uploadUrl = response.getHeaders()['Location'] || response.getHeaders()['location'];
-  
-  if (uploadUrl) {
-    return createResponse({ status: 'success', uploadUrl: uploadUrl });
-  } else {
-    return createResponse({ 
-      status: 'error', 
-      message: 'Drive rejected session: ' + response.getContentText() 
-    });
-  }
-}
-
-function handleLog(data) {
+/**
+ * Scans the specific folder for a filename. 
+ * If found (and created recently), logs it to the sheet.
+ */
+function checkDriveAndLog(fileName, category) {
   try {
-    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
-    const sheet = ss.getSheetByName(CONFIG.SHEET_NAME) || ss.getSheets()[0];
+    const folder = DriveApp.getFolderById(CONFIG.FOLDER_ID);
+    const files = folder.getFilesByName(fileName);
     
-    // Attempt to get file with retry loop (handles Drive API indexing delays)
-    let file = null;
-    let attempts = 0;
-    while (!file && attempts < 10) {
-      try {
-        if (data.fileId && data.fileId !== "UNKNOWN_ID" && data.fileId !== "UNKNOWN_ID_BUT_SUCCESS") {
-          file = DriveApp.getFileById(data.fileId);
-        }
-      } catch (e) {
-        // Drive API sometimes takes a second to index the new file
-        console.warn("File not found yet, retrying... " + attempts);
+    if (files.hasNext()) {
+      const file = files.next();
+      
+      // Safety Check: Only accept files created in the last 60 minutes
+      // This prevents matching with an old file named "Test.mp4" from last year.
+      const now = new Date();
+      const created = file.getDateCreated();
+      const diffMinutes = (now.getTime() - created.getTime()) / 1000 / 60;
+      
+      if (diffMinutes < 60) {
+        // Log it!
+        const logResult = logToSheet(category, file.getId());
+        
+        return createResponse({
+          status: 'found',
+          fileId: file.getId(),
+          fileUrl: file.getUrl(),
+          message: 'File detected and synced.'
+        });
       }
-      attempts++;
-      Utilities.sleep(1000); // Wait 1s between retries
     }
+    
+    // Not found yet
+    return createResponse({ status: 'pending', message: 'File not yet visible in Drive.' });
+    
+  } catch (e) {
+    return createResponse({ status: 'error', message: e.toString() });
+  }
+}
 
+function logToSheet(category, fileId) {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(CONFIG.SHEET_NAME) || ss.getSheets()[0];
+  
+  // 1. Check for duplicates to avoid spamming the sheet during polling
+  // We check the last 20 rows for this File ID
+  const lastRow = sheet.getLastRow();
+  if (lastRow > 0) {
+    // Column J is the 10th column (File Link), let's just check ID or Name
+    // Actually, checking URL is safer. 
+    const file = DriveApp.getFileById(fileId);
+    const fileUrl = file.getUrl();
+    
+    const checkRange = sheet.getRange(Math.max(1, lastRow - 20), 10, Math.min(20, lastRow), 1);
+    const values = checkRange.getValues();
+    for (let i = 0; i < values.length; i++) {
+      if (values[i][0] == fileUrl) {
+        return { status: 'success', note: 'Already logged' };
+      }
+    }
+    
+    // 2. Append if new
+    const nextRow = lastRow + 1;
     const timestamp = new Date();
-    const fileName = file ? file.getName() : "Unknown Asset (Upload Success)";
-    const fileUrl = file ? file.getUrl() : "File ID not found immediately";
-
-    // Row Logic: A=Date, E=Category, I=Name, J=Link
+    
     const rowData = [
-      timestamp, // A: Date
-      "",        // B
-      "",        // C
-      "",        // D
-      data.category || "General", // E: Category
-      "",        // F
-      "",        // G
-      "",        // H
-      fileName,  // I: File Name
-      fileUrl    // J: File Link
+      timestamp,           // A: Date
+      "",                  // B
+      "",                  // C
+      "",                  // D
+      category || "General", // E: Category
+      "",                  // F
+      "",                  // G
+      "",                  // H
+      file.getName(),      // I: File Name
+      fileUrl              // J: File Link
     ];
     
     sheet.appendRow(rowData);
-    
-    return createResponse({ 
-      status: 'success', 
-      loggedAs: fileName 
-    });
-  } catch (err) {
-    return createResponse({ 
-      status: 'error', 
-      message: 'Logging failed: ' + err.toString() 
-    });
+    return { status: 'success' };
+  } else {
+    // Empty sheet case
+     const file = DriveApp.getFileById(fileId);
+     sheet.appendRow([new Date(), "","","",category,"","","","", file.getName(), file.getUrl()]);
+     return { status: 'success' };
   }
 }
 
@@ -132,10 +132,5 @@ function createResponse(data) {
 }
 
 function doGet() {
-  // Simple reachability check
-  return createResponse({ 
-    status: 'active', 
-    version: '10.0', 
-    system: 'HYGR_PRODUCTION_API' 
-  });
+  return createResponse({ status: 'active', version: '11.0' });
 }
