@@ -1,5 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { UploadStatus } from '../types';
+import React, { useState, useEffect } from 'react';
 
 const INITIAL_CATEGORIES = [
   "Deo", "LB", "SS", "Mix", "FO", "HO", "LS", "CT", "BS", "EO", 
@@ -10,116 +9,238 @@ const INITIAL_CATEGORIES = [
 const DRIVE_FOLDER_LINK = "https://drive.google.com/drive/u/0/folders/1AyWWB3MnE-Bp7CxafzBvIt7txifiKOfe";
 const DEFAULT_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbxxk66Ir54a-6iFbAHmgX-Q3jal9fkW5z_uB7Fyx54Y3bdXYZN71n3L_5XAfV75PEJI/exec';
 
-type SyncPhase = 'IDLE' | 'RENAMING' | 'WAITING_FOR_DRIVE' | 'SYNCED';
+type SystemStatus = 'CHECKING' | 'ACTIVE' | 'INACTIVE' | 'ERROR';
 
 const UploadZone: React.FC = () => {
   const [webAppUrl, setWebAppUrl] = useState(() => localStorage.getItem('hygr_api_url') || DEFAULT_WEB_APP_URL);
   const [showSettings, setShowSettings] = useState(false);
+  const [systemStatus, setSystemStatus] = useState<SystemStatus>('CHECKING');
   
-  const [phase, setPhase] = useState<SyncPhase>('IDLE');
+  // Naming Form State
   const [category, setCategory] = useState(INITIAL_CATEGORIES[0]);
   const [customName, setCustomName] = useState('');
   const [extension, setExtension] = useState('.mp4');
   const [generatedName, setGeneratedName] = useState('');
-  
-  // Polling state
-  const [pollCount, setPollCount] = useState(0);
-  const timerRef = useRef<number | null>(null);
+  const [lastSyncTime, setLastSyncTime] = useState<string | null>(null);
 
   useEffect(() => {
-    // Auto-generate name when inputs change
+    // Generate name: Category - Name.ext
     const base = customName.trim() || "Untitled_Scene";
-    setGeneratedName(`${category} - ${base}${extension}`);
+    const ext = extension.startsWith('.') ? extension : `.${extension}`;
+    setGeneratedName(`${category} - ${base}${ext}`);
   }, [category, customName, extension]);
 
-  // Clean up timer
+  // Check system status on mount
   useEffect(() => {
-    return () => stopPolling();
-  }, []);
+    checkStatus();
+  }, [webAppUrl]);
 
-  const handleFileDrop = (e: React.DragEvent | React.ChangeEvent<HTMLInputElement>) => {
-    e.preventDefault();
-    let file: File | undefined;
-    
-    if ('dataTransfer' in e) {
-      file = e.dataTransfer.files?.[0];
-    } else {
-      file = (e.target as HTMLInputElement).files?.[0];
-    }
-
-    if (file) {
-      const ext = file.name.substring(file.name.lastIndexOf('.'));
-      setExtension(ext);
-      // Try to guess name from file if user hasn't typed one
-      if (!customName) {
-        setCustomName(file.name.replace(ext, '').replace(/_/g, ' '));
+  const checkStatus = async () => {
+    try {
+      setSystemStatus('CHECKING');
+      const response = await fetch(webAppUrl, {
+        method: 'POST',
+        body: JSON.stringify({ action: 'checkStatus' })
+      });
+      const data = await response.json();
+      if (data.status === 'active') {
+        setSystemStatus('ACTIVE');
+      } else {
+        setSystemStatus('INACTIVE');
       }
-      setPhase('RENAMING');
+    } catch (e) {
+      console.error(e);
+      setSystemStatus('ERROR');
+    }
+  };
+
+  const toggleService = async (enable: boolean) => {
+    try {
+      setSystemStatus('CHECKING');
+      const action = enable ? 'startSync' : 'stopSync';
+      const response = await fetch(webAppUrl, {
+        method: 'POST',
+        body: JSON.stringify({ action })
+      });
+      const data = await response.json();
+      if (data.status === 'success') {
+        checkStatus();
+      } else {
+        alert("Operation failed: " + data.message);
+        setSystemStatus('ERROR');
+      }
+    } catch (e) {
+      alert("Network Error");
+      setSystemStatus('ERROR');
+    }
+  };
+
+  const forceSyncNow = async () => {
+    const btn = document.getElementById('force-btn');
+    if(btn) btn.innerText = "Scanning...";
+    try {
+      await fetch(webAppUrl, {
+        method: 'POST',
+        body: JSON.stringify({ action: 'forceSync' })
+      });
+      setLastSyncTime(new Date().toLocaleTimeString());
+      if(btn) btn.innerText = "Scan Complete";
+      setTimeout(() => { if(btn) btn.innerText = "Force Scan Now"; }, 3000);
+    } catch (e) {
+      if(btn) btn.innerText = "Scan Failed";
     }
   };
 
   const copyToClipboard = () => {
     navigator.clipboard.writeText(generatedName);
-    // Visual feedback could be added here
-  };
-
-  const startWatcher = () => {
-    setPhase('WAITING_FOR_DRIVE');
-    setPollCount(0);
-    // Open Drive in new tab
-    window.open(DRIVE_FOLDER_LINK, '_blank');
-    
-    // Start polling immediately
-    timerRef.current = window.setInterval(checkDriveStatus, 5000); // Check every 5s
-  };
-
-  const stopPolling = () => {
-    if (timerRef.current) {
-      window.clearInterval(timerRef.current);
-      timerRef.current = null;
-    }
-  };
-
-  const checkDriveStatus = async () => {
-    try {
-      setPollCount(prev => prev + 1);
-      
-      const response = await fetch(webAppUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain' },
-        body: JSON.stringify({
-          action: 'scan',
-          fileName: generatedName,
-          category: category
-        })
-      });
-
-      const data = await response.json();
-      
-      if (data.status === 'found') {
-        stopPolling();
-        setPhase('SYNCED');
-      } else if (data.status === 'error') {
-        console.error("Backend Error:", data.message);
-      }
-      
-    } catch (e) {
-      console.warn("Poll failed, retrying...", e);
-    }
-  };
-
-  const reset = () => {
-    stopPolling();
-    setPhase('IDLE');
-    setCustomName('');
-    setPollCount(0);
   };
 
   return (
-    <div className="space-y-8 animate-fade-up">
+    <div className="space-y-8 animate-fade-up max-w-3xl mx-auto">
       
+      {/* --- STATUS DASHBOARD --- */}
+      <div className={`glass rounded-3xl p-6 flex flex-col md:flex-row items-center justify-between gap-6 border-l-4 ${
+        systemStatus === 'ACTIVE' ? 'border-l-emerald-500' : 
+        systemStatus === 'ERROR' ? 'border-l-red-500' : 'border-l-slate-500'
+      }`}>
+        <div className="flex items-center gap-4">
+          <div className="relative">
+            <div className={`w-3 h-3 rounded-full ${
+              systemStatus === 'ACTIVE' ? 'bg-emerald-500' : 
+              systemStatus === 'CHECKING' ? 'bg-yellow-500 animate-pulse' : 'bg-slate-500'
+            }`}></div>
+            {systemStatus === 'ACTIVE' && <div className="absolute inset-0 w-3 h-3 bg-emerald-500 rounded-full animate-ping opacity-75"></div>}
+          </div>
+          <div>
+            <h3 className="font-bold text-white text-sm uppercase tracking-widest">
+              Auto-Sync Service
+            </h3>
+            <p className="text-xs text-slate-400 mt-1">
+              {systemStatus === 'ACTIVE' && "Running. Checking Drive every minute."}
+              {systemStatus === 'INACTIVE' && "Service stopped. No automatic logging."}
+              {systemStatus === 'CHECKING' && "Connecting to server..."}
+              {systemStatus === 'ERROR' && "Connection Error. Check URL."}
+            </p>
+          </div>
+        </div>
+
+        <div className="flex gap-3">
+          {systemStatus === 'INACTIVE' && (
+            <button 
+              onClick={() => toggleService(true)}
+              className="bg-emerald-500 hover:bg-emerald-400 text-white text-xs font-bold px-4 py-2 rounded-lg transition-colors"
+            >
+              Start Service
+            </button>
+          )}
+          {systemStatus === 'ACTIVE' && (
+             <button 
+              onClick={() => toggleService(false)}
+              className="bg-white/5 hover:bg-red-500/20 text-slate-400 hover:text-red-400 text-xs font-bold px-4 py-2 rounded-lg transition-colors"
+            >
+              Stop Service
+            </button>
+          )}
+          <button 
+            id="force-btn"
+            onClick={forceSyncNow}
+            className="bg-white/10 hover:bg-white/20 text-white text-xs font-bold px-4 py-2 rounded-lg transition-colors flex items-center gap-2"
+          >
+            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Force Scan Now
+          </button>
+        </div>
+      </div>
+
+      {lastSyncTime && (
+        <div className="text-center text-[10px] text-emerald-400 font-mono">
+          Last manual scan completed at {lastSyncTime}
+        </div>
+      )}
+
+
+      {/* --- NAMING TOOL --- */}
+      <div className="glass p-8 md:p-10 rounded-[40px] shadow-2xl border-white/5 animate-fade-up">
+        
+        <div className="flex items-center gap-3 mb-8 pb-6 border-b border-white/5">
+          <div className="w-8 h-8 bg-white text-black rounded-lg flex items-center justify-center font-bold">1</div>
+          <h3 className="text-xl font-bold text-white">Generate Filename</h3>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+           <div className="space-y-2">
+              <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Category</label>
+              <select 
+                value={category}
+                onChange={(e) => setCategory(e.target.value)}
+                className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-emerald-500/50 cursor-pointer"
+              >
+                {INITIAL_CATEGORIES.map(c => <option key={c} value={c} className="text-black">{c}</option>)}
+              </select>
+           </div>
+           
+           <div className="space-y-2">
+              <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Extension</label>
+              <select 
+                value={extension}
+                onChange={(e) => setExtension(e.target.value)}
+                className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-emerald-500/50 cursor-pointer"
+              >
+                {['.mp4','.mov','.png','.jpg'].map(e => <option key={e} value={e} className="text-black">{e}</option>)}
+              </select>
+           </div>
+        </div>
+
+        <div className="space-y-2 mb-8">
+           <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Scene Name</label>
+           <input 
+             value={customName}
+             onChange={(e) => setCustomName(e.target.value)}
+             placeholder="e.g. Master_Shot_01"
+             className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-emerald-500/50 placeholder:text-slate-600"
+           />
+        </div>
+
+        <div className="bg-black/40 rounded-xl p-4 border border-white/5 flex flex-col md:flex-row gap-4 items-center">
+          <div className="flex-grow w-full">
+            <label className="text-[10px] text-slate-500 uppercase font-bold mb-1 block">Your Filename</label>
+            <code className="block w-full text-emerald-300 font-mono text-sm truncate select-all">
+              {generatedName}
+            </code>
+          </div>
+          <button 
+            onClick={copyToClipboard}
+            className="w-full md:w-auto bg-emerald-500 hover:bg-emerald-400 text-white font-bold rounded-lg px-6 py-3 transition-colors text-sm shadow-lg shadow-emerald-900/20 whitespace-nowrap"
+          >
+            Copy Name
+          </button>
+        </div>
+
+      </div>
+
+
+      {/* --- ACTION ZONE --- */}
+      <div className="glass p-8 rounded-[40px] animate-fade-up [animation-delay:100ms] text-center">
+         <div className="flex items-center justify-center gap-3 mb-4">
+            <div className="w-8 h-8 bg-white/10 text-white rounded-lg flex items-center justify-center font-bold">2</div>
+            <h3 className="text-xl font-bold text-white">Upload to Drive</h3>
+         </div>
+         <p className="text-slate-400 mb-8 max-w-lg mx-auto font-light">
+           Open the folder, rename your file, and upload. <br/>
+           <span className="text-emerald-400">The Auto-Sync service will detect it automatically.</span>
+         </p>
+         
+         <button 
+           onClick={() => window.open(DRIVE_FOLDER_LINK, '_blank')}
+           className="bg-white text-black font-bold text-lg px-12 py-4 rounded-2xl hover:scale-105 transition-all shadow-xl"
+         >
+           Open Drive Folder
+         </button>
+      </div>
+
+
       {/* --- SETTINGS TOGGLE --- */}
-      <div className="flex justify-center">
+      <div className="flex justify-center pt-8">
         <button 
           onClick={() => setShowSettings(!showSettings)}
           className="text-[10px] font-bold uppercase tracking-widest text-slate-600 hover:text-white transition-colors"
@@ -129,151 +250,19 @@ const UploadZone: React.FC = () => {
       </div>
 
       {showSettings && (
-        <div className="max-w-md mx-auto glass p-6 rounded-2xl animate-fade-up mb-8">
-           <label className="text-[10px] uppercase font-bold text-slate-500 mb-2 block">Web App URL</label>
+        <div className="glass p-6 rounded-2xl animate-fade-up mb-8">
+           <label className="text-[10px] uppercase font-bold text-slate-500 mb-2 block">Script URL</label>
            <input 
              value={webAppUrl} 
              onChange={(e) => {
                setWebAppUrl(e.target.value);
                localStorage.setItem('hygr_api_url', e.target.value);
              }}
-             className="w-full bg-black/50 border border-white/10 rounded-lg px-3 py-2 text-xs font-mono text-white mb-2" 
+             className="w-full bg-black/50 border border-white/10 rounded-lg px-3 py-2 text-xs font-mono text-white" 
            />
-           <p className="text-[10px] text-slate-400">Deploy New Version in Apps Script if backend logic changes.</p>
         </div>
       )}
 
-
-      {/* --- PHASE 1: IDLE (Drag & Drop) --- */}
-      {phase === 'IDLE' && (
-        <div 
-          onDragOver={(e) => e.preventDefault()}
-          onDrop={handleFileDrop}
-          className="relative glass rounded-[48px] p-12 flex flex-col items-center justify-center min-h-[400px] border-2 border-dashed border-white/10 hover:border-white/30 cursor-pointer transition-all group"
-        >
-          <div className="w-24 h-24 bg-white text-black rounded-3xl flex items-center justify-center mb-8 shadow-2xl transition-transform group-hover:scale-110 duration-500">
-            <svg className="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4v16m8-8H4"/></svg>
-          </div>
-          <h3 className="text-4xl font-bold text-white mb-3">Native Sync</h3>
-          <p className="text-slate-400 font-light text-lg">Drop your file to begin robust sync</p>
-          <input type="file" onChange={handleFileDrop} className="hidden" id="file-upload" />
-          <label htmlFor="file-upload" className="absolute inset-0 cursor-pointer"></label>
-        </div>
-      )}
-
-
-      {/* --- PHASE 2: RENAMING (Data Entry) --- */}
-      {phase === 'RENAMING' && (
-        <div className="max-w-xl mx-auto glass p-8 rounded-[40px] shadow-2xl border-white/5 animate-fade-up">
-          <div className="text-center mb-8">
-            <h3 className="text-2xl font-bold text-white">Asset Details</h3>
-            <p className="text-slate-400 text-sm">Define metadata for the production tracker.</p>
-          </div>
-
-          <div className="space-y-6">
-            <div>
-              <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1 mb-2 block">Category</label>
-              <select 
-                value={category}
-                onChange={(e) => setCategory(e.target.value)}
-                className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-white/30"
-              >
-                {INITIAL_CATEGORIES.map(c => <option key={c} value={c} className="text-black">{c}</option>)}
-              </select>
-            </div>
-            
-            <div>
-              <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1 mb-2 block">Scene Name</label>
-              <input 
-                value={customName}
-                onChange={(e) => setCustomName(e.target.value)}
-                placeholder="e.g. Master_Shot_01"
-                className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-white/30"
-              />
-            </div>
-
-            <div className="pt-6 border-t border-white/5">
-              <label className="text-[10px] font-bold text-emerald-400 uppercase tracking-widest ml-1 mb-2 block">Generated System Name</label>
-              <div className="flex gap-2">
-                <div className="flex-grow bg-emerald-500/10 border border-emerald-500/20 rounded-xl px-4 py-3 text-emerald-200 font-mono text-sm truncate">
-                  {generatedName}
-                </div>
-                <button 
-                  onClick={copyToClipboard}
-                  className="bg-white/10 hover:bg-white/20 text-white rounded-xl px-4 transition-colors"
-                  title="Copy Name"
-                >
-                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
-                </button>
-              </div>
-            </div>
-
-            <button 
-              onClick={startWatcher}
-              className="w-full bg-white text-black font-bold py-4 rounded-xl hover:scale-[1.02] active:scale-[0.98] transition-all shadow-xl mt-4"
-            >
-              Start Sync & Open Drive
-            </button>
-          </div>
-        </div>
-      )}
-
-
-      {/* --- PHASE 3: WATCHING (Polling) --- */}
-      {phase === 'WAITING_FOR_DRIVE' && (
-        <div className="max-w-xl mx-auto text-center py-12 animate-fade-up">
-          <div className="mb-8 relative">
-            <div className="w-24 h-24 bg-white/5 rounded-full flex items-center justify-center mx-auto border border-white/10 animate-pulse">
-               <svg className="w-10 h-10 text-white/50" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
-            </div>
-            <div className="absolute top-0 right-1/2 -mr-12 -mt-2">
-              <span className="flex h-4 w-4">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75"></span>
-                <span className="relative inline-flex rounded-full h-4 w-4 bg-blue-500"></span>
-              </span>
-            </div>
-          </div>
-
-          <h3 className="text-3xl font-bold text-white mb-2">Watching Drive...</h3>
-          <p className="text-slate-400 max-w-sm mx-auto mb-8 font-light leading-relaxed">
-            Please rename your file to <br/>
-            <span className="text-white font-mono bg-white/10 px-2 rounded mx-1">{generatedName}</span>
-            <br/>and upload it to the opened Drive tab.
-          </p>
-
-          <div className="inline-flex items-center gap-3 px-6 py-2 rounded-full bg-white/5 border border-white/10">
-            <span className="text-[10px] font-mono text-slate-500 uppercase tracking-widest">
-              Scan Attempt: {pollCount}
-            </span>
-          </div>
-
-          <div className="mt-12">
-            <button onClick={() => window.open(DRIVE_FOLDER_LINK, '_blank')} className="text-xs text-blue-400 hover:text-blue-300 underline underline-offset-4">
-              Re-open Drive Folder
-            </button>
-          </div>
-        </div>
-      )}
-
-
-      {/* --- PHASE 4: SUCCESS --- */}
-      {phase === 'SYNCED' && (
-        <div className="text-center animate-fade-up">
-           <div className="w-32 h-32 bg-emerald-500 rounded-full flex items-center justify-center mx-auto mb-8 shadow-2xl shadow-emerald-500/20">
-              <svg className="w-16 h-16 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M5 13l4 4L19 7"/></svg>
-           </div>
-           <h2 className="text-5xl font-bold text-white mb-4">Sync Complete</h2>
-           <p className="text-slate-400 mb-12">File detected in Drive and registered in Production Sheet.</p>
-           
-           <button 
-             onClick={reset}
-             className="px-12 py-4 bg-white text-black font-bold rounded-full hover:scale-105 transition-all"
-           >
-             Sync Another Asset
-           </button>
-        </div>
-      )}
-      
     </div>
   );
 };

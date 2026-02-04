@@ -1,130 +1,145 @@
 /**
- * HYGR Creative Flow - Backend v11.0 (Native Sync)
+ * HYGR Creative Flow - Backend v14.0 (Auto-Sync)
  * 
  * FEATURES:
- * - Direct Drive Scanning (Bypasses upload timeouts)
- * - Auto-Logging to Sheets
- * - Idempotent Logging (Prevents duplicates)
+ * - Time-Driven Automation (Runs every minute)
+ * - Remote Trigger Management
+ * - Filename Parsing (Category extraction)
  */
 
 const CONFIG = {
   FOLDER_ID: '1AyWWB3MnE-Bp7CxafzBvIt7txifiKOfe', 
   SPREADSHEET_ID: '1brCliL33hUu_IZaMfjb7AwlP7bXEmV6aMI26mx7ECxk', 
-  SHEET_NAME: 'Sheet1'
+  SHEET_NAME: 'Sheet1',
+  TRIGGER_FUNCTION: 'syncRecentFiles'
 };
 
 function doPost(e) {
   try {
     if (!e || !e.postData || !e.postData.contents) {
-      return createResponse({ status: 'error', message: 'No payload detected.' });
+      return createResponse({ status: 'error', message: 'No payload.' });
     }
     
     const data = JSON.parse(e.postData.contents);
     
-    // ACTION: SCAN (New Method)
-    // Checks if a file exists in Drive, and logs it if found.
-    if (data.action === 'scan') {
-      return checkDriveAndLog(data.fileName, data.category);
+    // ACTION: CHECK STATUS
+    if (data.action === 'checkStatus') {
+      const triggers = ScriptApp.getProjectTriggers();
+      const isActive = triggers.some(t => t.getHandlerFunction() === CONFIG.TRIGGER_FUNCTION);
+      return createResponse({ status: isActive ? 'active' : 'inactive' });
     }
     
-    // ACTION: LOG (Legacy Method)
-    else if (data.action === 'log') {
-      return logToSheet(data.category, data.fileId);
+    // ACTION: START SYNC SERVICE
+    if (data.action === 'startSync') {
+      // clear existing to avoid duplicates
+      const triggers = ScriptApp.getProjectTriggers();
+      triggers.forEach(t => {
+        if(t.getHandlerFunction() === CONFIG.TRIGGER_FUNCTION) ScriptApp.deleteTrigger(t);
+      });
+      
+      // Create new 1-minute trigger
+      ScriptApp.newTrigger(CONFIG.TRIGGER_FUNCTION)
+               .timeBased()
+               .everyMinutes(1)
+               .create();
+               
+      return createResponse({ status: 'success', message: 'Service Started' });
     }
     
-    return createResponse({ status: 'error', message: 'Invalid Action' });
+    // ACTION: STOP SYNC SERVICE
+    if (data.action === 'stopSync') {
+      const triggers = ScriptApp.getProjectTriggers();
+      triggers.forEach(t => {
+        if(t.getHandlerFunction() === CONFIG.TRIGGER_FUNCTION) ScriptApp.deleteTrigger(t);
+      });
+      return createResponse({ status: 'success', message: 'Service Stopped' });
+    }
+
+    // ACTION: FORCE SYNC (Manual run)
+    if (data.action === 'forceSync') {
+      syncRecentFiles();
+      return createResponse({ status: 'success', message: 'Scan Completed' });
+    }
+    
+    return createResponse({ status: 'error', message: 'Invalid Action v14.0' });
     
   } catch (err) {
-    return createResponse({ status: 'error', message: 'System Error: ' + err.toString() });
+    return createResponse({ status: 'error', message: 'Error: ' + err.toString() });
   }
 }
 
 /**
- * Scans the specific folder for a filename. 
- * If found (and created recently), logs it to the sheet.
+ * AUTOMATION WORKER
+ * This function is called by the Time Trigger every minute.
+ * It looks for files created in the last 10 minutes.
  */
-function checkDriveAndLog(fileName, category) {
+function syncRecentFiles() {
   try {
     const folder = DriveApp.getFolderById(CONFIG.FOLDER_ID);
-    const files = folder.getFilesByName(fileName);
     
-    if (files.hasNext()) {
+    // Search for non-trashed files created in the last 10 minutes (buffer for safety)
+    const tenMinutesAgo = new Date(new Date().getTime() - 10 * 60 * 1000);
+    const timeString = tenMinutesAgo.toISOString();
+    const query = `createdTime > '${timeString}' and trashed = false`;
+    
+    const files = folder.searchFiles(query);
+    
+    while (files.hasNext()) {
       const file = files.next();
-      
-      // Safety Check: Only accept files created in the last 60 minutes
-      // This prevents matching with an old file named "Test.mp4" from last year.
-      const now = new Date();
-      const created = file.getDateCreated();
-      const diffMinutes = (now.getTime() - created.getTime()) / 1000 / 60;
-      
-      if (diffMinutes < 60) {
-        // Log it!
-        const logResult = logToSheet(category, file.getId());
-        
-        return createResponse({
-          status: 'found',
-          fileId: file.getId(),
-          fileUrl: file.getUrl(),
-          message: 'File detected and synced.'
-        });
-      }
+      processFile(file);
     }
-    
-    // Not found yet
-    return createResponse({ status: 'pending', message: 'File not yet visible in Drive.' });
-    
   } catch (e) {
-    return createResponse({ status: 'error', message: e.toString() });
+    console.error("Sync Error: " + e.toString());
   }
 }
 
-function logToSheet(category, fileId) {
+/**
+ * LOGIC: Parse filename and log to sheet if new
+ */
+function processFile(file) {
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
   const sheet = ss.getSheetByName(CONFIG.SHEET_NAME) || ss.getSheets()[0];
+  const fileUrl = file.getUrl();
+  const fileName = file.getName();
   
-  // 1. Check for duplicates to avoid spamming the sheet during polling
-  // We check the last 20 rows for this File ID
+  // 1. Idempotency Check: Is this URL already in the last 50 rows?
   const lastRow = sheet.getLastRow();
   if (lastRow > 0) {
-    // Column J is the 10th column (File Link), let's just check ID or Name
-    // Actually, checking URL is safer. 
-    const file = DriveApp.getFileById(fileId);
-    const fileUrl = file.getUrl();
-    
-    const checkRange = sheet.getRange(Math.max(1, lastRow - 20), 10, Math.min(20, lastRow), 1);
+    const startRow = Math.max(1, lastRow - 50);
+    const numRows = Math.min(50, lastRow - startRow + 1); // fix range calc
+    const checkRange = sheet.getRange(startRow, 10, numRows, 1); // Col J is 10
     const values = checkRange.getValues();
+    
     for (let i = 0; i < values.length; i++) {
       if (values[i][0] == fileUrl) {
-        return { status: 'success', note: 'Already logged' };
+        return; // Exists, skip
       }
     }
-    
-    // 2. Append if new
-    const nextRow = lastRow + 1;
-    const timestamp = new Date();
-    
-    const rowData = [
-      timestamp,           // A: Date
-      "",                  // B
-      "",                  // C
-      "",                  // D
-      category || "General", // E: Category
-      "",                  // F
-      "",                  // G
-      "",                  // H
-      file.getName(),      // I: File Name
-      fileUrl              // J: File Link
-    ];
-    
-    sheet.appendRow(rowData);
-    return { status: 'success' };
-  } else {
-    // Empty sheet case
-     const file = DriveApp.getFileById(fileId);
-     sheet.appendRow([new Date(), "","","",category,"","","","", file.getName(), file.getUrl()]);
-     return { status: 'success' };
   }
+  
+  // 2. Parse Category from Filename: "Category - Scene Name.mp4"
+  let category = "General";
+  if (fileName.includes(" - ")) {
+    category = fileName.split(" - ")[0].trim();
+  }
+  
+  // 3. Log it
+  const rowData = [
+    new Date(),          // A: Date
+    "",                  // B
+    "",                  // C
+    "",                  // D
+    category,            // E: Category
+    "",                  // F
+    "",                  // G
+    "",                  // H
+    fileName,            // I: File Name
+    fileUrl              // J: File Link
+  ];
+  
+  sheet.appendRow(rowData);
 }
+
 
 function createResponse(data) {
   return ContentService.createTextOutput(JSON.stringify(data))
@@ -132,5 +147,5 @@ function createResponse(data) {
 }
 
 function doGet() {
-  return createResponse({ status: 'active', version: '11.0' });
+  return createResponse({ status: 'active', version: '14.0' });
 }
