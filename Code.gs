@@ -1,6 +1,13 @@
+
 /**
- * GOOGLE APPS SCRIPT BACKEND for HYGR Creative Flow
- * VERSION: v3.0-Chunked
+ * HYGR Creative Flow - Production Backend v9.0
+ * 
+ * SETUP INSTRUCTIONS:
+ * 1. Open Apps Script Editor.
+ * 2. Select 'setupPermissions' and click RUN.
+ * 3. Click 'Deploy' > 'New Deployment'.
+ * 4. Choose 'Web App'. Execute as 'Me'. Access: 'Anyone'.
+ * 5. COPY the URL and paste it into the Web App's "Configure Connection" section.
  */
 
 const CONFIG = {
@@ -9,110 +16,127 @@ const CONFIG = {
   SHEET_NAME: 'Sheet1'
 };
 
+function setupPermissions() {
+  try {
+    DriveApp.getFolderById(CONFIG.FOLDER_ID);
+    SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    console.log("Authorization Successful. System is Operational.");
+  } catch (e) {
+    console.error("Setup Error: Verify your Folder and Sheet IDs. " + e.toString());
+  }
+}
+
 function doPost(e) {
   try {
-    if (!e.postData || !e.postData.contents) {
-      throw new Error("No data received");
+    if (!e || !e.postData || !e.postData.contents) {
+      return createResponse({ status: 'error', message: 'No payload detected.' });
     }
     
     const data = JSON.parse(e.postData.contents);
     
-    // ACTION 1: Initialize Upload Session
     if (data.action === 'initialize') {
-      const mime = data.mimeType || "application/octet-stream";
-      // We return the Upload URL to the frontend
-      const uploadUrl = getResumableUploadUrl(data.fileName, mime);
-      return sendJsonResponse({ 
-        status: 'success', 
-        uploadUrl: uploadUrl, 
-        version: 'v3.0' 
-      });
-      
-    // ACTION 2: Log Completion
+      return handleInitialize(data);
     } else if (data.action === 'log') {
-      logToSheet(data.category, data.fileId);
-      return sendJsonResponse({ 
-        status: 'success', 
-        version: 'v3.0' 
-      });
-      
-    } else {
-      return sendJsonResponse({ 
-        status: 'error', 
-        message: 'INVALID_ACTION_OR_VERSION: Please Deploy New Version.' 
-      });
+      return handleLog(data);
     }
     
-  } catch (error) {
-    return sendJsonResponse({ status: 'error', message: error.toString() });
+    return createResponse({ status: 'error', message: 'Unknown action: ' + data.action });
+  } catch (err) {
+    return createResponse({ status: 'error', message: 'CORS/System Error: ' + err.toString() });
   }
 }
 
-function sendJsonResponse(data) {
+function handleInitialize(data) {
+  const url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable";
+  const metadata = {
+    name: data.fileName,
+    mimeType: data.mimeType || 'video/mp4',
+    parents: [CONFIG.FOLDER_ID]
+  };
+
+  const response = UrlFetchApp.fetch(url, {
+    method: "POST",
+    contentType: "application/json",
+    headers: { "Authorization": "Bearer " + ScriptApp.getOAuthToken() },
+    payload: JSON.stringify(metadata),
+    muteHttpExceptions: true
+  });
+
+  const uploadUrl = response.getHeaders()['Location'] || response.getHeaders()['location'];
+  
+  if (uploadUrl) {
+    return createResponse({ status: 'success', uploadUrl: uploadUrl });
+  } else {
+    return createResponse({ 
+      status: 'error', 
+      message: 'Drive rejected session: ' + response.getContentText() 
+    });
+  }
+}
+
+function handleLog(data) {
+  try {
+    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    const sheet = ss.getSheetByName(CONFIG.SHEET_NAME) || ss.getSheets()[0];
+    
+    // Attempt to get file with retry loop (handles Drive API indexing delays)
+    let file = null;
+    let attempts = 0;
+    while (!file && attempts < 5) {
+      try {
+        if (data.fileId && data.fileId !== "UNKNOWN_ID") {
+          file = DriveApp.getFileById(data.fileId);
+        }
+      } catch (e) {
+        attempts++;
+        Utilities.sleep(1500); // Wait longer between retries
+      }
+      if (file) break;
+      attempts++;
+    }
+
+    const timestamp = new Date();
+    const fileName = file ? file.getName() : "Unknown Asset";
+    const fileUrl = file ? file.getUrl() : "Link pending Drive indexing";
+
+    // Row Logic: A=Date, E=Category, I=Name, J=Link
+    const rowData = [
+      timestamp, // A: Date
+      "",        // B
+      "",        // C
+      "",        // D
+      data.category || "General", // E: Category
+      "",        // F
+      "",        // G
+      "",        // H
+      fileName,  // I: File Name
+      fileUrl    // J: File Link
+    ];
+    
+    sheet.appendRow(rowData);
+    
+    return createResponse({ 
+      status: 'success', 
+      loggedAs: fileName 
+    });
+  } catch (err) {
+    return createResponse({ 
+      status: 'error', 
+      message: 'Logging failed: ' + err.toString() 
+    });
+  }
+}
+
+function createResponse(data) {
   return ContentService.createTextOutput(JSON.stringify(data))
     .setMimeType(ContentService.MimeType.JSON);
 }
 
-/**
- * Gets a Resumable Upload URL from Google Drive API.
- * This URL allows the frontend to PUT file chunks directly.
- */
-function getResumableUploadUrl(fileName, mimeType) {
-  const url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable";
-  
-  const payload = {
-    "name": fileName,
-    "mimeType": mimeType,
-    "parents": [CONFIG.FOLDER_ID]
-  };
-
-  const params = {
-    method: "post",
-    contentType: "application/json",
-    headers: { 
-      "Authorization": "Bearer " + ScriptApp.getOAuthToken(),
-      "X-Upload-Content-Type": mimeType,
-      "X-Upload-Content-Length": "" // Optional but good practice
-    },
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  };
-
-  const response = UrlFetchApp.fetch(url, params);
-  
-  if (response.getResponseCode() === 200) {
-    return response.getAllHeaders()['Location'];
-  } else {
-    throw new Error('Drive API Init Failed: ' + response.getContentText());
-  }
-}
-
-function logToSheet(category, fileId) {
-  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
-  const sheet = ss.getSheetByName(CONFIG.SHEET_NAME) || ss.getSheets()[0];
-  
-  // Force a small delay to ensure Drive metadata propagation
-  Utilities.sleep(1000);
-  
-  const file = DriveApp.getFileById(fileId);
-  const nextRow = findNextUnusedRow(sheet, 9);
-  
-  sheet.getRange(nextRow, 1).setValue(new Date());
-  sheet.getRange(nextRow, 5).setValue(category);
-  sheet.getRange(nextRow, 9).setValue(file.getName());
-  sheet.getRange(nextRow, 10).setValue(file.getUrl());
-}
-
-function findNextUnusedRow(sheet, columnNumber) {
-  const lastRow = sheet.getLastRow();
-  if (lastRow === 0) return 1;
-  const values = sheet.getRange(1, columnNumber, lastRow).getValues();
-  for (let i = 1; i < values.length; i++) {
-    if (!values[i][0]) return i + 1;
-  }
-  return lastRow + 1;
-}
-
 function doGet() {
-  return HtmlService.createHtmlOutput("<h1>HYGR Creative Flow API v3.0 Active</h1>");
+  // Simple reachability check
+  return createResponse({ 
+    status: 'active', 
+    version: '9.0', 
+    system: 'HYGR_PRODUCTION_API' 
+  });
 }
